@@ -1,0 +1,47 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+
+# Distribution / packaging
+build/
+dist/
+*.egg-info/
+_version.py
+
+# IDE
+.vscode/
+
+# Virtual environment
+.venv/
+
+# Environment variables
+.env
+.env.*
+
+# Local data directories
+/data/
+
+# Large files
+*.pth
+*.npz
+*.nii.gz
+
+# Local scratch/tmp
+.scratch
+tmp
+.tmp*
+
+# AI assistants
+.claude/
+.codex/
+
+# Misc
+.DS_Store
+
+# Slurm outputs
+slurms/
+*.out
+*.err
+
+# Subdirectories
+/third_party/

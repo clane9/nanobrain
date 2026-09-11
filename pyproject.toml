@@ -1,0 +1,50 @@
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "nanobrain"
+description = "nanobrain"
+version = "0.1.0"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "braceexpand",
+    "datasets",
+    "einops",
+    "fsspec",
+    "huggingface-hub",
+    "jaxtyping",
+    "matplotlib",
+    "nibabel",
+    "numpy",
+    "omegaconf",
+    "pandas",
+    "pyyaml",
+    "s3fs",
+    "scikit-learn==1.8.0",
+    "scipy",
+    "tabulate",
+    "timm",
+    "torch==2.8.0",
+    "torchvision",
+    "tqdm",
+    "wandb",
+    "webdataset",
+]
+
+[dependency-groups]
+dev = [
+    "ipython",
+    "jupyter",
+    "matplotlib",
+    "pre-commit",
+    "pytest",
+    "python-dotenv",
+]
+
+[tool.ruff]
+line-length = 100
+
+[tool.ruff.lint]
+ignore = ["F722"]
