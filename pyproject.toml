@@ -7,11 +7,12 @@ name = "nanobrain"
 description = "nanobrain"
 version = "0.1.0"
 readme = "README.md"
-requires-python = ">=3.11"
+requires-python = ">=3.14"
 dependencies = [
     "braceexpand",
     "datasets",
     "einops",
+    "flask",
     "fsspec",
     "huggingface-hub",
     "jaxtyping",
@@ -22,11 +23,12 @@ dependencies = [
     "pandas",
     "pyyaml",
     "s3fs",
-    "scikit-learn==1.8.0",
+    "scikit-image",
+    "scikit-learn",
     "scipy",
     "tabulate",
     "timm",
-    "torch==2.8.0",
+    "torch==2.9.1",
     "torchvision",
     "tqdm",
     "wandb",
