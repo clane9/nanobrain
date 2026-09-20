@@ -1,7 +1,10 @@
+import math
+
 import nibabel as nib
 import numpy as np
 import scipy.ndimage as ndi
-from nibabel.processing import resample_to_output, resample_from_to
+from nibabel.affines import rescale_affine
+from nibabel.processing import resample_to_output, resample_from_to, smooth_image
 
 
 def threshold_mask(
@@ -60,3 +63,35 @@ def largest_component(mask: np.ndarray):
         sizes = ndi.sum_labels(mask, label, range(1, count + 1))
         mask = label == (np.argmax(sizes) + 1)
     return mask
+
+
+def conform_image(
+    img: nib.Nifti1Image,
+    min_voxel_size: float = 1.0,
+    max_fov: tuple[float, float, float] = (256.0, 256.0, 256.0),
+    order: int = 1,
+):
+    """Conform image to target minimum voxel size and max FOV.
+
+    References:
+        https://github.com/nipy/nibabel/blob/5.4.2/nibabel/processing.py#L318
+    """
+    assert img.ndim == 3, f"expected 3D image, got {img.ndim}"
+    img = nib.as_closest_canonical(img)
+
+    # new voxel size no smaller than min voxel size
+    voxel_sizes = img.header.get_zooms()
+    new_voxel_sizes = [max(min_voxel_size, sz) for sz in voxel_sizes]
+    # new fov no bigger than target
+    fov = [w * sz for w, sz in zip(img.shape, voxel_sizes)]
+    new_fov = [min(w_, w) for w_, w in zip(max_fov, fov)]
+    new_shape = [math.ceil(w / sz) for w, sz in zip(new_fov, new_voxel_sizes)]
+
+    # smooth if downsampling
+    if any(sz_ > sz for sz_, sz in zip(new_voxel_sizes, voxel_sizes)):
+        img = smooth_image(img, fwhm=new_voxel_sizes)
+
+    # resample with cropping
+    new_affine = rescale_affine(img.affine, img.shape, new_voxel_sizes, new_shape)
+    new_img = resample_from_to(img, (new_shape, new_affine), order=order)
+    return new_img
