@@ -12,6 +12,7 @@ def threshold_mask(
     resolution: float | None = 2.0,
     sigma: float | None = 4.0,
     remove_islands: bool = True,
+    fill_holes: bool = True,
 ) -> nib.Nifti1Image:
     """Threshold based head masking.
 
@@ -19,6 +20,7 @@ def threshold_mask(
         resolution: target resolution to compute the mask at.
         sigma: gaussian smoothing sigma in mm.
         remove_islands: keep only largest connected component.
+        fill_holes: fill holes enclosed by the mask.
 
     Returns:
         mask nibabel image
@@ -51,6 +53,8 @@ def threshold_mask(
     # morphology cleanup
     if remove_islands:
         mask = largest_component(mask)
+    if fill_holes:
+        mask = ndi.binary_fill_holes(mask)
 
     mask_img = nib.Nifti1Image(mask.astype(np.uint8), img.affine)
     mask_img = resample_from_to(mask_img, orig_img, order=0)
@@ -79,20 +83,18 @@ def conform_image(
     assert img.ndim == 3, f"expected 3D image, got {img.ndim}"
     img = nib.as_closest_canonical(img)
 
-    # new voxel size no smaller than min voxel size
     voxel_sizes = img.header.get_zooms()
     new_voxel_sizes = [max(min_voxel_size, sz) for sz in voxel_sizes]
-    # new fov no bigger than target
     fov = [w * sz for w, sz in zip(img.shape, voxel_sizes)]
     new_fov = [min(w_, w) for w_, w in zip(max_fov, fov)]
     new_shape = [math.ceil(w / sz) for w, sz in zip(new_fov, new_voxel_sizes)]
 
-    # smooth if downsampling
     if any(sz_ > sz for sz_, sz in zip(new_voxel_sizes, voxel_sizes)):
         fwhm = [math.sqrt(sz_**2 - sz**2) for sz_, sz in zip(new_voxel_sizes, voxel_sizes)]
         img = smooth_image(img, fwhm=fwhm)
 
     # resample with cropping
+    # nb, this can crop out some of the brain, centering on the centroid might be better.
     new_affine = rescale_affine(img.affine, img.shape, new_voxel_sizes, new_shape)
     new_img = resample_from_to(img, (new_shape, new_affine), order=order)
     return new_img
