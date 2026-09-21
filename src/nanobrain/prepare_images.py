@@ -19,7 +19,7 @@ logger = logging.getLogger()
 
 TOTAL_BATCHES = 64
 LOG_INTERVAL = 100
-PREFETCH_THREADS = 8
+PREFETCH_THREADS = 1
 JPEG_QUALITY = 85
 
 
@@ -39,7 +39,15 @@ def main(args: argparse.Namespace):
     offsets = np.linspace(0, len(paths), TOTAL_BATCHES + 1, dtype=np.int64).tolist()
     start, stop = offsets[args.index : args.index + 2]
     paths = paths[start:stop]
-    dataset = Fomo300K(root=args.root, filelist=paths, prefetch_threads=PREFETCH_THREADS)
+
+    # limit concurrency to prevent fsspec timeout errors
+    # the script is going to be parallelized anyway
+    dataset = Fomo300K(
+        root=args.root,
+        filelist=paths,
+        prefetch_threads=PREFETCH_THREADS,
+        storage_options={"max_concurrency": 1},
+    )
 
     logger.info("example paths:\n\t" + "\n\t".join(paths[:5]))
 
