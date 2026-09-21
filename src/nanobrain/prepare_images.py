@@ -274,7 +274,7 @@ if __name__ == "__main__":
     parser.add_argument("--root", type=str, default=DEFAULT_ROOT)
     parser.add_argument("--filelist", type=Path, default=DEFAULT_FILELIST)
     parser.add_argument("--min-voxel-size", type=float, default=1.0)
-    parser.add_argument("--max-fov", type=float, nargs=3, default=(208.0, 240.0, 208.0))
+    parser.add_argument("--max-fov", type=float, nargs=3, default=(192.0, 240.0, 192.0))
     parser.add_argument("--nbits", type=int, default=12)
     args = parser.parse_args()
     main(args)
