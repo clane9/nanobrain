@@ -24,7 +24,7 @@ class Fomo300K(IterableDataset):
     def __init__(
         self,
         root: str = DEFAULT_ROOT,
-        filelist: str = DEFAULT_FILELIST,
+        filelist: str | Path | list[str] = DEFAULT_FILELIST,
         suffixes: list[str] | None = DEFAULT_SUFFIXES,
         shuffle: bool = False,
         random_state: int | np.random.Generator | None = None,
@@ -41,8 +41,11 @@ class Fomo300K(IterableDataset):
         self.prefetch_threads = prefetch_threads
         self.storage_options = storage_options
 
-        with fsspec.open(filelist, "rt") as f:
-            paths = f.read().strip().splitlines()
+        if isinstance(filelist, (str, Path)):
+            with fsspec.open(filelist, "rt") as f:
+                paths = f.read().strip().splitlines()
+        else:
+            paths = filelist
         self.paths_ = np.array(paths)
         self.rng_ = np.random.default_rng(random_state)
 
@@ -59,7 +62,7 @@ class Fomo300K(IterableDataset):
             storage_options=self.storage_options,
         ):
             for name, img in read_fomo300_zip(fullpath, suffixes=self.suffixes):
-                fullname = f"{path.removesuffix('.zip')}/{name}"
+                fullname = f"{Path(path).parent}/{name}"
                 yield fullname, img
 
 

@@ -89,7 +89,8 @@ def conform_image(
 
     # smooth if downsampling
     if any(sz_ > sz for sz_, sz in zip(new_voxel_sizes, voxel_sizes)):
-        img = smooth_image(img, fwhm=new_voxel_sizes)
+        fwhm = [math.sqrt(sz_**2 - sz**2) for sz_, sz in zip(new_voxel_sizes, voxel_sizes)]
+        img = smooth_image(img, fwhm=fwhm)
 
     # resample with cropping
     new_affine = rescale_affine(img.affine, img.shape, new_voxel_sizes, new_shape)
