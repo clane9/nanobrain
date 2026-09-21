@@ -98,13 +98,13 @@ def conform_image(
         img = smooth_image(img, fwhm=fwhm)
 
     # update center to be relative to the top of the mask to leave out more neck
-    centroid = (np.array(img.shape) - 1) / 2
+    centroid = (np.array(img.shape) - 1) // 2
     mask = np.asarray(mask_img.dataobj) > 0
     mask_z_ids = np.nonzero(mask.any(axis=(0, 1)))[0]
     top = mask_z_ids.max() + top_margin / voxel_sizes[2]
     top = min(top, img.shape[2])
     half_height = new_fov[2] / voxel_sizes[2] / 2
-    centroid[2] = top - half_height
+    centroid[2] = round(top - half_height)
 
     # resample with cropping
     new_affine = rescale_affine(
@@ -119,7 +119,7 @@ def rescale_affine(
     shape: tuple[int, int, int],
     zooms: tuple[float, float, float],
     new_shape: tuple[int, int, int] | None = None,
-    centroid: tuple[float, float, float] | None = None,
+    centroid: tuple[int, int, int] | None = None,
 ):
     """Return a new affine matrix with updated voxel sizes.
 
@@ -131,12 +131,12 @@ def rescale_affine(
     """
     shape = np.asarray(shape)
     new_shape = np.array(new_shape if new_shape is not None else shape)
-    centroid = np.array(centroid if centroid is not None else (shape - 1) / 2)
+    centroid = np.array(centroid if centroid is not None else (shape - 1) // 2)
 
     s = nib.affines.voxel_sizes(affine)
     rzs_out = affine[:3, :3] * zooms / s
 
     # Using xyz = A @ ijk, determine translation
     centroid = nib.affines.apply_affine(affine, centroid)
-    t_out = centroid - rzs_out @ ((new_shape - 1) / 2)
+    t_out = centroid - rzs_out @ ((new_shape - 1) // 2)
     return nib.affines.from_matvec(rzs_out, t_out)
