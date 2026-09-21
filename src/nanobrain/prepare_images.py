@@ -8,6 +8,7 @@ from pathlib import Path
 
 import numpy as np
 import nibabel as nib
+from nibabel.processing import resample_from_to
 import scipy.ndimage as ndi
 from PIL import Image
 
@@ -76,10 +77,12 @@ def main(args: argparse.Namespace):
                 f"done [{num_images:05d}] {name}; tput: {sps:.1f} im/s, errors: {num_errors}"
             )
 
-    sps = num_images / (time.time() - t0)
+    elapsed = time.time() - t0
+    sps = num_images / elapsed
     logger.info(
         f"finished batch {args.index:03d}; "
-        f"images: {num_images}, errors: {num_errors}, tput: {sps:.1f} im/s"
+        f"images: {num_images}, errors: {num_errors}, "
+        f"tput: {sps:.1f} im/s, elapsed: {elapsed / 3600:.2f} hr"
     )
 
 
@@ -100,13 +103,14 @@ def process_image(
         return
 
     # minimal preprocessing
-    #   1. fit the image to the size/resolution constraints
-    #   2. compute a fast and loose threshold based head mask
+    #   1. compute a fast threshold based head mask
+    #   2. fit the image to the size/resolution constraints, cropping z from the top of the mask
     #   3. quantize values to a fixed number of bits
     t0 = time.time()
-    fit_img = preproc.conform_image(img, min_voxel_size=min_voxel_size, max_fov=max_fov)
+    mask_img = preproc.threshold_mask(img)
     t1 = time.time()
-    mask_img = preproc.threshold_mask(fit_img)
+    fit_img = preproc.conform_image(img, mask_img, min_voxel_size=min_voxel_size, max_fov=max_fov)
+    mask_img = resample_from_to(mask_img, fit_img, order=0)
     t2 = time.time()
     q_img, (vmin, vmax) = quantize_image(fit_img, mask_img, nbits=nbits)
     t3 = time.time()
@@ -163,8 +167,8 @@ def process_image(
         "mask_volume": float(mask_volume),
         "vmin": float(vmin),
         "vmax": float(vmax),
-        "fit_time": t1 - t0,
-        "mask_time": t2 - t1,
+        "mask_time": t1 - t0,
+        "fit_time": t2 - t1,
         "q_time": t3 - t2,
         "total_time": t4 - t0,
     }
@@ -270,7 +274,7 @@ if __name__ == "__main__":
     parser.add_argument("--root", type=str, default=DEFAULT_ROOT)
     parser.add_argument("--filelist", type=Path, default=DEFAULT_FILELIST)
     parser.add_argument("--min-voxel-size", type=float, default=1.0)
-    parser.add_argument("--max-fov", type=float, nargs=3, default=(256.0, 256.0, 256.0))
+    parser.add_argument("--max-fov", type=float, nargs=3, default=(208.0, 240.0, 208.0))
     parser.add_argument("--nbits", type=int, default=12)
     args = parser.parse_args()
     main(args)

@@ -30,7 +30,8 @@ def test_conform_image(test_img: nib.Nifti1Image):
     test_img = resample_to_output(test_img, (0.5, 1.0, 3.0), order=1)
     mvs = 1.0
     max_fov = (208.0, 240.0, 120.0)
-    fit_img = preproc.conform_image(test_img, min_voxel_size=mvs, max_fov=max_fov)
+    mask_img = preproc.threshold_mask(test_img)
+    fit_img = preproc.conform_image(test_img, mask_img, min_voxel_size=mvs, max_fov=max_fov)
     spacing = fit_img.header.get_zooms()
     fov = [w * sz for w, sz in zip(fit_img.shape, spacing)]
     assert all(sz >= mvs for sz in spacing)
