@@ -15,7 +15,9 @@ def main(args: argparse.Namespace):
     filtered = filtered[filtered.keep].drop(columns="keep")
     filtered = filtered.sort_values("name").reset_index(drop=True)
 
-    one_per_suffix = filtered.groupby(["subject", "suffix"]).head(1)
+    first_session = filtered.groupby("subject").session.transform("first")
+    first_session = filtered[filtered.session == first_session]
+    one_per_suffix = first_session.groupby(["session", "suffix"]).head(1)
 
     rng = np.random.default_rng(args.seed)
     kept_subjects = []
@@ -26,7 +28,12 @@ def main(args: argparse.Namespace):
         kept_subjects.extend(subjects)
     subsampled = one_per_suffix[one_per_suffix.subject.isin(kept_subjects)]
 
-    stages = {"filtered": filtered, "one per suffix": one_per_suffix, "capped": subsampled}
+    stages = {
+        "filtered": filtered,
+        "first session": first_session,
+        "one per suffix": one_per_suffix,
+        "capped": subsampled,
+    }
     for label, df in stages.items():
         dataset_counts = df.groupby("dataset").size().sort_values(ascending=False)
         top_10_share = dataset_counts.iloc[:10].sum() / len(df)

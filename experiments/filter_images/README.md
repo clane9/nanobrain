@@ -63,14 +63,22 @@ uv run python experiments/filter_images/plot_montages.py   # figures/montages/
 
 ```bash
 uv run python experiments/filter_images/subsample_images.py  # subsample.parquet, filelist_subsampled.txt
+uv run python experiments/filter_images/plot_subsample.py    # figures/subsample/
 ```
 
-Keep the first image per (subject, suffix), then at most 200 random subjects per dataset.
+Keep the first session per subject and the first image per suffix within it, then at most 200 random subjects per dataset.
 
 | Stage | Images | Subjects | GB |
 |---|---|---|---|
 | Filtered | 88,049 | 37,487 | 305 |
-| One per (subject, suffix) | 58,580 | 37,487 | 231 |
-| ≤200 subjects per dataset | 47,837 | 32,361 | 195 |
+| First session per subject | 70,100 | 37,487 | 259 |
+| One image per suffix | 57,484 | 37,487 | 228 |
+| ≤200 subjects per dataset | 46,883 | 32,361 | 192 |
 
 The cap cuts FLAIR the most (4.6K to 2.0K), since 58% of FLAIR images come from three datasets.
+
+![suffixes](figures/subsample/suffixes.png)
+
+![datasets](figures/subsample/datasets.png)
+
+![subjects](figures/subsample/subjects.png)
