@@ -34,7 +34,7 @@ def main(args: argparse.Namespace):
     args.out_dir.mkdir(parents=True, exist_ok=True)
     page_size = COLUMNS * ROWS
 
-    for rule in ["adc_map", "partial_coverage", "bad_mask"]:
+    for rule in ["adc_map", "partial_coverage", "bad_mask", "low_contrast"]:
         excluded = filters[filters[rule]]
         sample = excluded.sample(min(page_size, len(excluded)), random_state=args.seed)
         make_montage(sample).save(args.out_dir / f"excluded_{rule}.png")

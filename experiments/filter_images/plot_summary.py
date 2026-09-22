@@ -154,6 +154,25 @@ def plot_intensity(df: pd.DataFrame, out_dir: Path):
     plt.close(fig)
 
 
+def plot_contrast(df: pd.DataFrame, out_dir: Path):
+    quantiles = np.stack(df.qs)
+    p10 = quantiles[:, 2]
+    median = quantiles[:, 4]
+    p90 = quantiles[:, 6]
+    contrast = (p90 - p10) / median
+
+    fig, ax = plt.subplots(figsize=(6, 4))
+    for suffix in SUFFIXES:
+        sub = contrast[df.suffix == suffix]
+        ax.hist(sub, bins=np.linspace(0, 4, 81), histtype="step", label=suffix)
+    ax.set_yscale("log")
+    ax.set_title("Contrast in mask: (p90 - p10) / median")
+    ax.legend()
+    fig.tight_layout()
+    fig.savefig(out_dir / "contrast.png", dpi=150)
+    plt.close(fig)
+
+
 def plot_file_size(df: pd.DataFrame, out_dir: Path):
     fig, axs = plt.subplots(1, 2, figsize=(10, 4))
     for suffix in SUFFIXES:
@@ -181,6 +200,7 @@ def main(args: argparse.Namespace):
     plot_fov(df, args.out_dir)
     plot_mask(df, args.out_dir)
     plot_intensity(df, args.out_dir)
+    plot_contrast(df, args.out_dir)
     plot_file_size(df, args.out_dir)
 
 

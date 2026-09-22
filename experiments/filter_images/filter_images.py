@@ -7,22 +7,32 @@ import pandas as pd
 ADC_MAX_VALUE = 1.0
 MIN_MASK_EXTENT = 100.0
 MAX_MASK_FRACTION = 0.75
-RULES = ["adc_map", "partial_coverage", "bad_mask"]
+MIN_CONTRAST = 0.65
+RULES = ["adc_map", "partial_coverage", "bad_mask", "low_contrast"]
 
 
 def main(args: argparse.Namespace):
     df = pd.read_parquet(args.metadata)
     mask_extent = np.stack(df.mask_fov)
+    quantiles = np.stack(df.qs)
+    p10 = quantiles[:, 2]
+    median = quantiles[:, 4]
+    p90 = quantiles[:, 6]
+    with np.errstate(divide="ignore", invalid="ignore"):
+        contrast = (p90 - p10) / median
 
     filters = df[["name", "path", "dataset", "suffix", "size_bytes"]].copy()
     filters["adc_map"] = (df.suffix == "bval1000") & (df.vmax < ADC_MAX_VALUE)
     filters["partial_coverage"] = mask_extent.min(axis=1) < MIN_MASK_EXTENT
     filters["bad_mask"] = df.mask_frac > MAX_MASK_FRACTION
+    filters["low_contrast"] = contrast < MIN_CONTRAST
     filters["keep"] = ~filters[RULES].any(axis=1)
 
     for rule in RULES:
         count = filters[rule].sum()
-        print(f"{rule}: {count:,} ({count / len(filters):.1%})")
+        other_rules = [other for other in RULES if other != rule]
+        only_count = (filters[rule] & ~filters[other_rules].any(axis=1)).sum()
+        print(f"{rule}: {count:,} ({count / len(filters):.1%}), {only_count:,} by this rule only")
     kept = filters[filters.keep]
     print(f"kept: {len(kept):,} / {len(filters):,} ({len(kept) / len(filters):.1%})")
     print(f"kept size: {kept.size_bytes.sum() / 1e9:.0f} GB")
