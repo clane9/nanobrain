@@ -2,9 +2,32 @@
 
 Remove corrupt and non-brain images from `data/FOMO300K_images`.
 
+## Summary
+
 ```bash
 uv run python experiments/filter_images/index_metadata.py  # data/FOMO300K_images/metadata.parquet
 uv run python experiments/filter_images/plot_summary.py    # figures/summary/
+```
+
+![suffixes](figures/summary/suffixes.png)
+
+![datasets](figures/summary/datasets.png)
+
+![subjects](figures/summary/subjects.png)
+
+![spacing](figures/summary/spacing.png)
+
+![fov](figures/summary/fov.png)
+
+![mask](figures/summary/mask.png)
+
+![intensity](figures/summary/intensity.png)
+
+![file_size](figures/summary/file_size.png)
+
+## Filtering
+
+```bash
 uv run python experiments/filter_images/filter_images.py   # filter.parquet, filelist_filtered.txt
 uv run python experiments/filter_images/plot_montages.py   # figures/montages/
 ```
@@ -28,21 +51,3 @@ uv run python experiments/filter_images/plot_montages.py   # figures/montages/
 **Random kept**
 
 ![kept](figures/montages/kept_0.png)
-
-## Summary plots (before filtering)
-
-![suffixes](figures/summary/suffixes.png)
-
-![datasets](figures/summary/datasets.png)
-
-![subjects](figures/summary/subjects.png)
-
-![spacing](figures/summary/spacing.png)
-
-![fov](figures/summary/fov.png)
-
-![mask](figures/summary/mask.png)
-
-![intensity](figures/summary/intensity.png)
-
-![file_size](figures/summary/file_size.png)
