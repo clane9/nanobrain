@@ -3,7 +3,6 @@ from pathlib import Path
 import numpy as np
 import torch
 import torch.nn.functional as F
-from einops import rearrange
 from torch.utils.data import Dataset
 
 GRID_SHAPE = (192, 240, 192)
@@ -78,36 +77,3 @@ def fit_to_shape(
             before = diff
         pad += [before, diff - before]
     return F.pad(image, pad)
-
-
-def extract_patches(
-    image: torch.Tensor, mask: torch.Tensor, patch_size: int = 8
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    p = patch_size
-    patches = rearrange(image, "(gx px) (gy py) (gz pz) -> (gx gy gz) (px py pz)", px=p, py=p, pz=p)
-    mask_patches = rearrange(
-        mask, "(gx px) (gy py) (gz pz) -> (gx gy gz) (px py pz)", px=p, py=p, pz=p
-    )
-
-    grid_shape = [size // p for size in image.shape]
-    grid_ids = [torch.arange(size, device=image.device) for size in grid_shape]
-    coords = torch.stack(torch.meshgrid(*grid_ids, indexing="ij"), dim=-1)
-    coords = coords.reshape(-1, 3)
-    return patches, mask_patches, coords
-
-
-def random_sample_sequences(
-    mask_patches: torch.Tensor,
-    num_sequences: int,
-    seq_length: int,
-    min_mask_frac: float = 0.25,
-) -> torch.Tensor:
-    mask_frac = mask_patches.mean(dim=1)
-    num_patches = len(mask_patches)
-
-    # one independent shuffle per sequence, with patches outside the mask sorted last so
-    # they are only used when a volume has too few mask patches
-    scores = torch.rand(num_sequences, num_patches, device=mask_patches.device)
-    scores = torch.where(mask_frac >= min_mask_frac, scores, 2.0)
-    order = scores.argsort(dim=1)[:, :seq_length]
-    return order
