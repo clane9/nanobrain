@@ -78,7 +78,8 @@ def conform_image(
 ):
     """Conform image to target minimum voxel size and max FOV.
 
-    The z crop is taken from the top of the head mask (plus top_margin mm) down.
+    The x/y crop is centered on the head mask. The z crop is taken from the top of the
+    head mask (plus top_margin mm) down.
 
     References:
         https://github.com/nipy/nibabel/blob/5.4.2/nibabel/processing.py#L318
@@ -97,10 +98,16 @@ def conform_image(
         fwhm = [math.sqrt(sz_**2 - sz**2) for sz_, sz in zip(new_voxel_sizes, voxel_sizes)]
         img = smooth_image(img, fwhm=fwhm)
 
-    # update center to be relative to the top of the mask to leave out more neck
-    centroid = (np.array(img.shape) - 1) // 2
+    # initialize voxel center on mask bbox center
     mask = np.asarray(mask_img.dataobj) > 0
+    mask_x_ids = np.nonzero(mask.any(axis=(1, 2)))[0]
+    mask_y_ids = np.nonzero(mask.any(axis=(0, 2)))[0]
     mask_z_ids = np.nonzero(mask.any(axis=(0, 1)))[0]
+    centroid = np.array(
+        [round((ids.min() + ids.max()) / 2) for ids in [mask_x_ids, mask_y_ids, mask_z_ids]]
+    )
+
+    # anchor z to the top of the mask to cut out neck rather than brain
     top = mask_z_ids.max() + top_margin / voxel_sizes[2]
     top = min(top, img.shape[2])
     half_height = new_fov[2] / voxel_sizes[2] / 2
