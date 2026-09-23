@@ -14,12 +14,8 @@ RULES = ["adc_map", "partial_coverage", "bad_mask", "low_contrast"]
 def main(args: argparse.Namespace):
     df = pd.read_parquet(args.metadata)
     mask_extent = np.stack(df.mask_fov)
-    quantiles = np.stack(df.qs)
-    p10 = quantiles[:, 2]
-    median = quantiles[:, 4]
-    p90 = quantiles[:, 6]
     with np.errstate(divide="ignore", invalid="ignore"):
-        contrast = (p90 - p10) / median
+        contrast = (df["q0.9"] - df["q0.1"]) / df["q0.5"]
 
     filters = df[["name", "path", "dataset", "suffix", "size_bytes"]].copy()
     filters["adc_map"] = (df.suffix == "bval1000") & (df.vmax < ADC_MAX_VALUE)
@@ -41,7 +37,7 @@ def main(args: argparse.Namespace):
     args.out_dir.mkdir(parents=True, exist_ok=True)
     filters.to_parquet(args.out_dir / "filter.parquet")
 
-    filelist = [name.replace(".nii.gz", ".nii.zst") for name in kept.name]
+    filelist = [name.replace(".nii.gz", ".npz") for name in kept.name]
     (args.out_dir / "filelist_filtered.txt").write_text("\n".join(filelist) + "\n")
 
 

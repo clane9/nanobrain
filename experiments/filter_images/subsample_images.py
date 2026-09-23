@@ -47,7 +47,7 @@ def main(args: argparse.Namespace):
 
     args.out_dir.mkdir(parents=True, exist_ok=True)
     subsampled.to_parquet(args.out_dir / "subsample.parquet")
-    filelist = [name.replace(".nii.gz", ".nii.zst") for name in subsampled.name]
+    filelist = [name.replace(".nii.gz", ".npz") for name in subsampled.name]
     (args.out_dir / "filelist_subsampled.txt").write_text("\n".join(filelist) + "\n")
 
 

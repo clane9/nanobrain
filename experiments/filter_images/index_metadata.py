@@ -12,9 +12,11 @@ NUM_THREADS = 32
 def load_record(meta_path: Path) -> dict:
     record = json.loads(meta_path.read_text())
 
-    image_path = meta_path.with_name(meta_path.name.replace(".meta.json", ".nii.zst"))
+    image_path = meta_path.with_name(meta_path.name.replace(".meta.json", ".npz"))
     record["path"] = str(image_path)
-    record["size_bytes"] = image_path.stat().st_size
+
+    for quantile, value in record.pop("qs").items():
+        record[f"q{quantile}"] = value
 
     parts = record["name"].split("/")
     record["dataset"] = parts[1]
