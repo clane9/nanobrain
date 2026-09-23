@@ -4,6 +4,8 @@ from pathlib import Path
 import pandas as pd
 from PIL import Image, ImageDraw
 
+from filter_images import RULES
+
 VIEWS = ["sag", "cor", "ax"]
 THUMB_SIZE = 96
 LABEL_HEIGHT = 12
@@ -22,7 +24,7 @@ def make_montage(rows: pd.DataFrame) -> Image.Image:
         x = (ii % COLUMNS) * cell_width
         y = (ii // COLUMNS) * cell_height
         draw.text((x + 2, y), f"{row.dataset} {row.suffix}", fill=0)
-        stem = row.path.removesuffix(".nii.zst")
+        stem = row.path.removesuffix(".npz")
         for jj, view in enumerate(VIEWS):
             thumb = Image.open(f"{stem}.{view}.jpg").resize((THUMB_SIZE, THUMB_SIZE))
             montage.paste(thumb, (x + jj * THUMB_SIZE, y + LABEL_HEIGHT))
@@ -34,7 +36,7 @@ def main(args: argparse.Namespace):
     args.out_dir.mkdir(parents=True, exist_ok=True)
     page_size = COLUMNS * ROWS
 
-    for rule in ["adc_map", "partial_coverage", "bad_mask", "low_contrast"]:
+    for rule in RULES:
         excluded = filters[filters[rule]]
         sample = excluded.sample(min(page_size, len(excluded)), random_state=args.seed)
         make_montage(sample).save(args.out_dir / f"excluded_{rule}.png")

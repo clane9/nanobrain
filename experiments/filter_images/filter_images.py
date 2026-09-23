@@ -8,7 +8,8 @@ ADC_MAX_VALUE = 1.0
 MIN_MASK_EXTENT = 100.0
 MAX_MASK_FRACTION = 0.75
 MIN_CONTRAST = 0.65
-RULES = ["adc_map", "partial_coverage", "bad_mask", "low_contrast"]
+MAX_SATURATION = 0.9
+RULES = ["adc_map", "partial_coverage", "bad_mask", "low_contrast", "saturated"]
 
 
 def main(args: argparse.Namespace):
@@ -22,6 +23,7 @@ def main(args: argparse.Namespace):
     filters["partial_coverage"] = mask_extent.min(axis=1) < MIN_MASK_EXTENT
     filters["bad_mask"] = df.mask_frac > MAX_MASK_FRACTION
     filters["low_contrast"] = contrast < MIN_CONTRAST
+    filters["saturated"] = df["q0.5"] / df["q0.995"] > MAX_SATURATION
     filters["keep"] = ~filters[RULES].any(axis=1)
 
     for rule in RULES:

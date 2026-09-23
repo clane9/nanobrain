@@ -155,11 +155,7 @@ def plot_intensity(df: pd.DataFrame, out_dir: Path):
 
 
 def plot_contrast(df: pd.DataFrame, out_dir: Path):
-    quantiles = np.stack(df.qs)
-    p10 = quantiles[:, 2]
-    median = quantiles[:, 4]
-    p90 = quantiles[:, 6]
-    contrast = (p90 - p10) / median
+    contrast = (df["q0.9"] - df["q0.1"]) / df["q0.5"]
 
     fig, ax = plt.subplots(figsize=(6, 4))
     for suffix in SUFFIXES:
