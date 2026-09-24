@@ -181,9 +181,15 @@ def train_one_epoch(
     metric_logger.add_meter("lr", misc.SmoothedValue(window_size=1, fmt="{value:.6f}"))
     metric_logger.add_meter("grad", misc.SmoothedValue())
     metric_logger.add_meter("loss", misc.SmoothedValue())
-    metric_logger.add_meter("vol/s", misc.SmoothedValue(window_size=1, fmt="{value:.1f}"))
-    metric_logger.add_meter("tflop/s", misc.SmoothedValue(window_size=1, fmt="{value:.1f}"))
-    metric_logger.add_meter("watts", misc.SmoothedValue(window_size=1, fmt="{value:.0f}"))
+    metric_logger.add_meter(
+        "vol/s", misc.SmoothedValue(window_size=1, fmt="{value:.0f} ({global_avg:.0f})")
+    )
+    metric_logger.add_meter(
+        "tflop/s", misc.SmoothedValue(window_size=1, fmt="{value:.0f} ({global_avg:.0f})")
+    )
+    metric_logger.add_meter(
+        "watts", misc.SmoothedValue(window_size=1, fmt="{value:.0f} ({global_avg:.0f})")
+    )
     header = f"Train: [{epoch}]"
 
     throughput = misc.ThroughputMeter(
