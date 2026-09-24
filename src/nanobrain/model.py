@@ -18,7 +18,7 @@ class ViTMAE3D(nn.Module):
         num_heads: int = 12,
         decoder_depth: int = 4,
         decoder_embed_dim: int = 512,
-        decoder_num_heads: int = 16,  # default from mae, head dim = 32
+        decoder_num_heads: int = 8,
         qkv_bias: bool = True,
         proj_bias: bool = True,
         mlp_ratio: int | float = 4,
