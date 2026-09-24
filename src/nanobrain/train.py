@@ -15,6 +15,7 @@ from matplotlib import pyplot as plt
 from omegaconf import DictConfig, OmegaConf
 from torch import Tensor
 from torch.utils.data import DataLoader, default_collate
+from torch.utils.flop_counter import FlopCounterMode
 
 import nanobrain.utils.misc as misc
 from nanobrain.data import BrainNpzDataset, process_sample
@@ -90,6 +91,13 @@ def main(args: DictConfig):
     num_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     logger.info(f"num params: {num_params / 1e6:.1f}M")
 
+    batch_flops = count_batch_flops(args, model, device)
+    logger.info(f"flops per batch (fwd + bwd): {batch_flops / 1e12:.2f} TFLOP")
+
+    if args.compile:
+        # in place compile keeps the state dict keys
+        model.compile()
+
     # optimizer
     # batch size counts sequences, following mae_st which scales by repeated samples
     total_batch_size = args.batch_size * args.num_samples * args.accum_iter
@@ -109,7 +117,7 @@ def main(args: DictConfig):
     misc.update_wd(param_groups, args.weight_decay)
     # cast or else it corrupts the checkpoint
     betas = tuple(args.betas) if args.betas is not None else None
-    optimizer = torch.optim.AdamW(param_groups, betas=betas, fused=True)
+    optimizer = torch.optim.AdamW(param_groups, betas=betas, fused=args.fused_adamw)
 
     epoch_num_batches = len(train_loader)
     steps_per_epoch = math.ceil(epoch_num_batches / args.accum_iter)
@@ -145,6 +153,7 @@ def main(args: DictConfig):
             lr_schedule,
             epoch,
             device,
+            batch_flops,
         )
 
         merged_stats = {"epoch": epoch, **train_stats}
@@ -166,12 +175,16 @@ def train_one_epoch(
     lr_schedule: Sequence[float],
     epoch: int,
     device: torch.device,
+    batch_flops: float,
 ):
     model.train()
 
     metric_logger = misc.MetricLogger(delimiter="  ")
     metric_logger.add_meter("lr", misc.SmoothedValue(window_size=1, fmt="{value:.6f}"))
     metric_logger.add_meter("grad", misc.SmoothedValue())
+    metric_logger.add_meter("loss", misc.SmoothedValue())
+    metric_logger.add_meter("vol/s", misc.SmoothedValue(window_size=1, fmt="{value:.1f}"))
+    metric_logger.add_meter("tflop/s", misc.SmoothedValue(window_size=1, fmt="{value:.1f}"))
     header = f"Train: [{epoch}]"
 
     epoch_num_batches = len(data_loader)
@@ -183,6 +196,8 @@ def train_one_epoch(
     use_cuda = device.type == "cuda"
 
     optimizer.zero_grad()
+    window_start_time = time.monotonic()
+    window_start_step = 0
 
     for batch_idx, batch in enumerate(
         metric_logger.log_every(data_loader, print_freq, header, total_steps=num_batches)
@@ -231,12 +246,26 @@ def train_one_epoch(
         if need_update:
             metric_logger.update(lr=lr, grad=grad_norm)
 
+        # throughput over the steps since the last log step. sync so the gpu work is counted
+        if log_step:
+            if use_cuda:
+                torch.cuda.synchronize()
+            elapsed = time.monotonic() - window_start_time
+            window_steps = batch_step - window_start_step
+            vols_per_sec = window_steps * args.batch_size / elapsed
+            tflops_per_sec = window_steps * batch_flops / elapsed / 1e12
+            metric_logger.update(**{"vol/s": vols_per_sec, "tflop/s": tflops_per_sec})
+            window_start_time = time.monotonic()
+            window_start_step = batch_step
+
         if need_update and log_step and args.wandb:
             wandb.log(
                 {
                     "train/loss": metric_logger.loss.value,
                     "train/lr": lr,
                     "train/grad": metric_logger.grad.value,
+                    "train/vol_per_sec": vols_per_sec,
+                    "train/tflop_per_sec": tflops_per_sec,
                 },
                 step=int(1000 * (epoch + batch_step / epoch_num_batches)),
             )
@@ -269,6 +298,27 @@ def train_one_epoch(
 
     logger.info(f"Averaged stats: {metric_logger}")
     return {f"train/{k}": meter.global_avg for k, meter in metric_logger.meters.items()}
+
+
+def count_batch_flops(args: DictConfig, model: nn.Module, device: torch.device) -> float:
+    # fwd + bwd flops of one training batch, on dummy images where every patch is in the mask
+    amp_dtype = getattr(torch, args.amp_dtype)
+    images = torch.zeros(args.batch_size, *args.grid_size, device=device)
+    masks = torch.ones(args.batch_size, *args.grid_size, device=device)
+    flop_counter = FlopCounterMode(display=False)
+    with flop_counter:
+        with torch.autocast(device_type=device.type, dtype=amp_dtype, enabled=args.amp):
+            loss = model(
+                images,
+                masks,
+                num_visible=args.num_visible,
+                num_predict=args.num_predict,
+                num_samples=args.num_samples,
+                with_state=False,
+            )
+        loss.backward()
+    model.zero_grad(set_to_none=True)
+    return flop_counter.get_total_flops()
 
 
 def make_plots(
