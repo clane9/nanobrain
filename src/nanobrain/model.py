@@ -31,11 +31,12 @@ class ViTMAE3D(nn.Module):
         self.class_tokens = class_tokens
         patch_grid_size = tuple(size // patch_size for size in grid_size)
 
-        # encoder
         patch_dim = patch_size**3
+        self.register_buffer("coord_grid", make_coord_grid(grid_size, patch_size), persistent=False)
+
+        # encoder
         self.patch_embed = nn.Linear(patch_dim, embed_dim)
         self.pos_embed = SeparablePosEmbed3D(patch_grid_size, embed_dim)
-        self.register_buffer("coord_grid", make_coord_grid(grid_size, patch_size), persistent=False)
         if class_tokens:
             self.cls_token = nn.Parameter(torch.empty(1, class_tokens, embed_dim))
         else:
@@ -138,7 +139,7 @@ class ViTMAE3D(nn.Module):
         images: Float[Tensor, "B X Y Z"],
         mask: Float[Tensor, "B X Y Z"],
         num_visible: int,
-        num_predict: int,
+        num_predict: int | None = None,
         num_samples: int = 1,
         with_state: bool = True,
     ):
@@ -150,7 +151,10 @@ class ViTMAE3D(nn.Module):
         coord = self.coord_grid.expand(B, -1, -1)
 
         # sample num_samples sequences per image, then flatten them into the batch
-        order = sample_sequences(mask_patches, num_samples, num_visible + num_predict)
+        # num_predict None predicts all remaining patches (dense decoding)
+        seq_length = None if num_predict is None else num_visible + num_predict
+        order = sample_sequences(mask_patches, num_samples, seq_length)
+        num_predict = order.shape[2] - num_visible
         batch_ids = torch.arange(B, device=images.device)[:, None, None]
         patches = patches[batch_ids, order].flatten(0, 1)
         mask_patches = mask_patches[batch_ids, order].flatten(0, 1)
@@ -240,7 +244,7 @@ def make_coord_grid(
 def sample_sequences(
     mask_patches: torch.Tensor,
     num_samples: int,
-    seq_length: int,
+    seq_length: int | None = None,
     min_mask_frac: float = 0.25,
 ) -> torch.Tensor:
     batch_size, num_patches, _ = mask_patches.shape
@@ -249,6 +253,9 @@ def sample_sequences(
     # they are only used when a volume has too few mask patches
     scores = torch.rand(batch_size, num_samples, num_patches, device=mask_patches.device)
     scores = torch.where(mask_frac[:, None, :] >= min_mask_frac, scores, 2.0)
+    if seq_length is None:
+        # one host sync to get the longest mask sequence in the batch
+        seq_length = (mask_frac >= min_mask_frac).sum(dim=1).max().item()
     order = scores.argsort(dim=2)[:, :, :seq_length]
     return order
 
