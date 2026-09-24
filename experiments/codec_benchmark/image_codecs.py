@@ -1,6 +1,6 @@
 import gzip
 import io
-from compression import zstd
+import zstandard as zstd
 
 import nibabel as nib
 import numpy as np

@@ -3,8 +3,8 @@
 Compare encodings for the prepared images in `data/FOMO300K_images`. Current format is `.nii.zst`.
 
 ```bash
-uv run python experiments/codec_benchmark/benchmark.py
-uv run --with imagecodecs python experiments/codec_benchmark/benchmark.py  # adds npz-jxl
+uv run --with zstandard python experiments/codec_benchmark/benchmark.py
+uv run --with zstandard --with imagecodecs python experiments/codec_benchmark/benchmark.py  # adds npz-jxl
 ```
 
 Codecs are in `image_codecs.py`. All use a standard container (nifti or npz) and store the affine.

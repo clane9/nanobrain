@@ -3,7 +3,7 @@ import os
 import shutil
 import sys
 import time
-from compression import zstd
+import zstandard as zstd
 from concurrent.futures import ProcessPoolExecutor
 from pathlib import Path
 

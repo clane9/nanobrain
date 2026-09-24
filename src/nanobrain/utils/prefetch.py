@@ -1,8 +1,10 @@
 import secrets
 import shutil
 import tempfile
+from collections import deque
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+from typing import Callable, Iterable
 
 import fsspec
 from fsspec.implementations.local import LocalFileSystem
@@ -40,7 +42,9 @@ def prefetch(
 
     try:
         with ThreadPoolExecutor(max_workers) as executor:
-            for path, f in executor.map(fn, paths, buffersize=prefetch_factor * max_workers):
+            for path, f in buffer_map(
+                executor, fn, paths, buffersize=prefetch_factor * max_workers
+            ):
                 yield path, f
 
                 if delete and is_remote:
@@ -48,6 +52,31 @@ def prefetch(
     finally:
         if delete:
             shutil.rmtree(cache_dir)
+
+
+def buffer_map(
+    executor: ThreadPoolExecutor,
+    fn: Callable,
+    *iterables: Iterable,
+    buffersize: int = 16,
+):
+    """A buffered version of executor.map() to avoid submitting too many tasks at once."""
+    window = deque()
+    it = iter(zip(*iterables))
+
+    for _ in range(buffersize):
+        args = next(it, None)
+        if args is None:
+            break
+        window.append(executor.submit(fn, *args))
+
+    while window:
+        future = window.popleft()
+        yield future.result()
+
+        args = next(it, None)
+        if args is not None:
+            window.append(executor.submit(fn, *args))
 
 
 def get_file_atomic(fs: fsspec.AbstractFileSystem, rpath: str, lpath: str | Path, *args, **kwargs):
