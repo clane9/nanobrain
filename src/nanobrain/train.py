@@ -75,8 +75,6 @@ def main(args: DictConfig):
         pin_memory=True,
         drop_last=True,
         persistent_workers=args.num_workers > 0,
-        # python 3.14 default forkserver hangs at exit joining workers, spawn is slow to start
-        multiprocessing_context="fork" if args.num_workers > 0 else None,
         prefetch_factor=args.prefetch_factor if args.num_workers > 0 else None,
     )
 
