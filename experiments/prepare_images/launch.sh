@@ -22,6 +22,6 @@ EXP_DIR="experiments/prepare_images"
 OUT_DIR="data/FOMO300K_images"
 
 parallel --jobs 64 \
-    uv run --no-sync python -m nanobrain.prepare_images {} \
+    uv run --no-sync python -m nanobrain.prepare {} \
     --out-root "${OUT_DIR}" \
     ::: {0..63}

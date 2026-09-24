@@ -2,7 +2,7 @@
 
 Freeze the pretraining split up front: first session per subject, then cap subjects per dataset.
 Output is committed to `src/nanobrain/config/fomo300k_filelist_openneuro_subsampled.txt` and is the
-input to `prepare_images`.
+input to `prepare`.
 
 ```bash
 uv run python experiments/subsample_sessions/subsample_sessions.py
