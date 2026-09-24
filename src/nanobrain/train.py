@@ -183,7 +183,12 @@ def train_one_epoch(
     metric_logger.add_meter("loss", misc.SmoothedValue())
     metric_logger.add_meter("vol/s", misc.SmoothedValue(window_size=1, fmt="{value:.1f}"))
     metric_logger.add_meter("tflop/s", misc.SmoothedValue(window_size=1, fmt="{value:.1f}"))
+    metric_logger.add_meter("watts", misc.SmoothedValue(window_size=1, fmt="{value:.0f}"))
     header = f"Train: [{epoch}]"
+
+    throughput = misc.ThroughputMeter(
+        {"vol": args.batch_size, "tflop": batch_flops / 1e12}, device=device
+    )
 
     epoch_num_batches = len(data_loader)
     steps_per_epoch = math.ceil(epoch_num_batches / args.accum_iter)
@@ -194,8 +199,6 @@ def train_one_epoch(
     use_cuda = device.type == "cuda"
 
     optimizer.zero_grad()
-    window_start_time = time.monotonic()
-    window_start_step = 0
 
     for batch_idx, batch in enumerate(
         metric_logger.log_every(data_loader, print_freq, header, total_steps=num_batches)
@@ -244,17 +247,9 @@ def train_one_epoch(
         if need_update:
             metric_logger.update(lr=lr, grad=grad_norm)
 
-        # throughput over the steps since the last log step. sync so the gpu work is counted
+        throughput.step()
         if log_step:
-            if use_cuda:
-                torch.cuda.synchronize()
-            elapsed = time.monotonic() - window_start_time
-            window_steps = batch_step - window_start_step
-            vols_per_sec = window_steps * args.batch_size / elapsed
-            tflops_per_sec = window_steps * batch_flops / elapsed / 1e12
-            metric_logger.update(**{"vol/s": vols_per_sec, "tflop/s": tflops_per_sec})
-            window_start_time = time.monotonic()
-            window_start_step = batch_step
+            metric_logger.update(**throughput.compute())
 
         if need_update and log_step and args.wandb:
             wandb.log(
@@ -262,8 +257,9 @@ def train_one_epoch(
                     "train/loss": metric_logger.loss.value,
                     "train/lr": lr,
                     "train/grad": metric_logger.grad.value,
-                    "train/vol_per_sec": vols_per_sec,
-                    "train/tflop_per_sec": tflops_per_sec,
+                    "train/vol_per_sec": metric_logger.meters["vol/s"].value,
+                    "train/tflop_per_sec": metric_logger.meters["tflop/s"].value,
+                    "train/watts": metric_logger.meters["watts"].value,
                 },
                 step=int(1000 * (epoch + batch_step / epoch_num_batches)),
             )

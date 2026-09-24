@@ -25,6 +25,12 @@ from torch import Tensor
 from torch.amp import GradScaler
 from torch.optim import Optimizer
 
+# optional, only used for gpu power in ThroughputMeter
+try:
+    import pynvml
+except ImportError:
+    pynvml = None
+
 logger = logging.getLogger(__name__)
 
 
@@ -507,6 +513,47 @@ def pre_send_to_cuda_wrapper(generator, device=None):
 
 
 # other misc utils
+
+
+class ThroughputMeter:
+    """Rates per second over a window of steps, plus average gpu power over the window."""
+
+    def __init__(self, units_per_step: dict[str, float], device: torch.device | None = None):
+        self.units_per_step = units_per_step
+        self.device = device
+        self.gpu_handle = None
+        if pynvml is not None and device is not None and device.type == "cuda":
+            # match by uuid since nvml device indices ignore CUDA_VISIBLE_DEVICES
+            pynvml.nvmlInit()
+            uuid = torch.cuda.get_device_properties(device).uuid
+            self.gpu_handle = pynvml.nvmlDeviceGetHandleByUUID(f"GPU-{uuid}")
+        self.reset()
+
+    def reset(self):
+        self.start_time = time.monotonic()
+        self.num_steps = 0
+        if self.gpu_handle is not None:
+            self.start_energy = pynvml.nvmlDeviceGetTotalEnergyConsumption(self.gpu_handle)
+
+    def step(self):
+        self.num_steps += 1
+
+    def compute(self) -> dict[str, float]:
+        # sync so queued gpu work is counted in this window
+        if self.device is not None and self.device.type == "cuda":
+            torch.cuda.synchronize(self.device)
+        elapsed = time.monotonic() - self.start_time
+
+        stats = {}
+        for name, units in self.units_per_step.items():
+            stats[f"{name}/s"] = self.num_steps * units / elapsed
+        if self.gpu_handle is not None:
+            # energy counter is in mJ
+            energy = pynvml.nvmlDeviceGetTotalEnergyConsumption(self.gpu_handle)
+            stats["watts"] = (energy - self.start_energy) / 1000 / elapsed
+
+        self.reset()
+        return stats
 
 
 def random_seed(seed: int) -> None:

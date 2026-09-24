@@ -18,8 +18,10 @@ _version.py
 .env
 .env.*
 
-# Local data directories
+# Local data/output directories
 /data/
+wandb/
+output/
 
 # Large files
 *.pth
