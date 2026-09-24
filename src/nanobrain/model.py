@@ -90,6 +90,8 @@ class ViTMAE3D(nn.Module):
         if self.class_tokens:
             nn.init.normal_(self.cls_token, std=0.02)
         nn.init.normal_(self.mask_token, std=0.02)
+        # initialize the decoder head to zero to prevent hockey stick
+        self.decoder_head.weight.data.mul_(0.0)
 
     def forward_encoder(
         self,
