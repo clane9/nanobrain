@@ -20,11 +20,13 @@ EXP_NAME="baseline"
 EXP_DIR="experiments/${EXP_NAME}"
 OUT_DIR="${EXP_DIR}/output"
 
-name="vits_run1"
+name="vits_run2"
 fullname="${EXP_NAME}/${name}"
+notes="upgrade to pytorch 3.14+cuda130"
 
 uv run --no-sync python -m nanobrain.train \
     --overrides \
     name="${fullname}" \
+    notes="${notes}" \
     output_dir="${OUT_DIR}" \
     wandb=false
