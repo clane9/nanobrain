@@ -21,7 +21,6 @@ _version.py
 # Local data/output directories
 /data/
 wandb/
-output/
 
 # Large files
 *.pth
