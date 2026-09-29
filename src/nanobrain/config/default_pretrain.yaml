@@ -20,7 +20,7 @@ patch_size: 8
 
 # Sequence sampling. ~6400 mask patches per image on average, so num_visible 1280 is a
 # ~0.8 mask ratio.
-num_visible: 1280
+num_visible: 1279
 num_predict: 1280
 num_samples: 2
 
