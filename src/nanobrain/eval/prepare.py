@@ -16,7 +16,6 @@ import numpy as np
 import zstandard
 from nibabel.processing import resample_from_to
 from SynthSeg_pytorch import SynthSegPredictor
-from torch.utils.data import Dataset
 from tqdm import tqdm
 
 import nanobrain.utils.preprocessing as preproc
@@ -29,35 +28,6 @@ FOMO_URL = "https://sid.erda.dk/share_redirect/fmeuvo1EdF"
 GRID_FOV = (192.0, 240.0, 192.0)
 VMIN_QUANTILE = 0.005
 VMAX_QUANTILE = 0.995
-
-
-class EvalDataset(Dataset):
-    """Prepared eval dataset. Decodes the requested images to float32 arrays."""
-
-    def __init__(self, dataset: hfds.Dataset, image_keys: list[str]):
-        # drop unused image columns so they are never read
-        unused_keys = [
-            key
-            for key, feature in dataset.features.items()
-            if feature.dtype == "large_binary" and key not in image_keys
-        ]
-        self.dataset = dataset.remove_columns(unused_keys)
-        self.image_keys = image_keys
-
-    def __len__(self) -> int:
-        return len(self.dataset)
-
-    def __getitem__(self, index: int) -> dict:
-        sample = self.dataset[index]
-        for key in self.image_keys:
-            img = decode_nifti_zst(sample[key])
-            sample[key] = img.get_fdata(dtype=np.float32)
-        return sample
-
-
-def load_dataset(name: str, image_keys: list[str]) -> EvalDataset:
-    dataset = hfds.load_from_disk(EVAL_ROOT / name)
-    return EvalDataset(dataset, image_keys)
 
 
 def prepare_fomo_task1(num_workers: int, device: str) -> hfds.Dataset:
@@ -316,10 +286,6 @@ def truncate_image(
 
 def encode_nifti_zst(img: nib.Nifti1Image) -> bytes:
     return zstandard.compress(img.to_bytes())
-
-
-def decode_nifti_zst(data: bytes) -> nib.Nifti1Image:
-    return nib.Nifti1Image.from_bytes(zstandard.decompress(data))
 
 
 if __name__ == "__main__":
