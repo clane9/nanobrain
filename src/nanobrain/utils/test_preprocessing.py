@@ -38,6 +38,16 @@ def test_conform_image(test_img: nib.Nifti1Image):
     assert all(w <= w_ for w, w_ in zip(fov, max_fov))
 
 
+def test_conform_image_fixed_grid(test_img: nib.Nifti1Image):
+    test_img = resample_to_output(test_img, (0.5, 1.0, 3.0), order=1)
+    mask_img = preproc.threshold_mask(test_img)
+    fit_img = preproc.conform_image(
+        test_img, mask_img, min_voxel_size=1.0, max_fov=(192.0, 240.0, 192.0), fixed_grid=True
+    )
+    assert fit_img.shape == (192, 240, 192)
+    assert np.allclose(fit_img.header.get_zooms(), 1.0)
+
+
 def test_conform_image_exact_copy(test_img: nib.Nifti1Image):
     test_img = nib.as_closest_canonical(test_img)
     max_fov = (151.0, 180.0, 150.0)

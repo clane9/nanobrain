@@ -75,27 +75,40 @@ def conform_image(
     max_fov: tuple[float, float, float] = (208.0, 240.0, 208.0),
     top_margin: float = 5.0,
     order: int = 1,
+    fixed_grid: bool = False,
 ):
     """Conform image to target minimum voxel size and max FOV.
 
     The x/y crop is centered on the head mask. The z crop is taken from the top of the
     head mask (plus top_margin mm) down.
 
+    With fixed_grid, resample to exactly min_voxel_size spacing on a grid spanning max_fov,
+    zero padding where the image does not reach.
+
     References:
         https://github.com/nipy/nibabel/blob/5.4.2/nibabel/processing.py#L318
     """
     assert img.ndim == 3, f"expected 3D image, got {img.ndim}"
     img = nib.as_closest_canonical(img)
+    # resampling keeps the input dtype, so integer images would be rounded after interpolation
+    img = nib.Nifti1Image(img.get_fdata(dtype=np.float32), img.affine)
     mask_img = nib.as_closest_canonical(mask_img)
 
     voxel_sizes = img.header.get_zooms()
-    new_voxel_sizes = [max(min_voxel_size, sz) for sz in voxel_sizes]
-    fov = [w * sz for w, sz in zip(img.shape, voxel_sizes)]
-    new_fov = [min(w_, w) for w_, w in zip(max_fov, fov)]
+    if fixed_grid:
+        new_voxel_sizes = 3 * [min_voxel_size]
+        new_fov = list(max_fov)
+    else:
+        new_voxel_sizes = [max(min_voxel_size, sz) for sz in voxel_sizes]
+        fov = [w * sz for w, sz in zip(img.shape, voxel_sizes)]
+        new_fov = [min(w_, w) for w_, w in zip(max_fov, fov)]
     new_shape = [math.ceil(w / sz) for w, sz in zip(new_fov, new_voxel_sizes)]
 
+    # smooth before downsampling. upsampled axes (fixed grid only) get no smoothing
     if any(sz_ > sz for sz_, sz in zip(new_voxel_sizes, voxel_sizes)):
-        fwhm = [math.sqrt(sz_**2 - sz**2) for sz_, sz in zip(new_voxel_sizes, voxel_sizes)]
+        fwhm = [
+            math.sqrt(max(sz_**2 - sz**2, 0.0)) for sz_, sz in zip(new_voxel_sizes, voxel_sizes)
+        ]
         img = smooth_image(img, fwhm=fwhm)
 
     # initialize voxel center on mask bbox center
