@@ -35,6 +35,7 @@ dependencies = [
     "tqdm",
     "wandb",
     "webdataset",
+    "zstandard",
 ]
 
 [dependency-groups]
