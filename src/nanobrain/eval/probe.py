@@ -27,6 +27,15 @@ HISTOGRAM_RANGE = (-4.0, 4.0)
 
 
 class Encoder(nn.Module):
+    """Generic model interface that a model must implement for probe eval.
+
+    Shapes are fixed:
+    - Input grid [X Y Z] = [192 240 192], 1mm
+    - Patch grid [Gx Gy Gz] = [24 30 24], 8mm
+
+    Inputs are raw values in [0, 2**16). Preprocessing must happen in the embedding functions.
+    """
+
     def global_embed(
         self,
         images: Float[Tensor, "B X Y Z"],
@@ -38,6 +47,9 @@ class Encoder(nn.Module):
         images: Float[Tensor, "B X Y Z"],
         mask: Float[Tensor, "B X Y Z"],
     ) -> Float[Tensor, "B Gx Gy Gz C"]: ...
+
+    @classmethod
+    def from_config(cls, args: dict) -> "Encoder": ...
 
 
 class RawVoxelEncoder(nn.Module):
@@ -411,9 +423,8 @@ def fit_predict_segmentation(
     train_features = torch.cat([patch_features[ii] for ii in train_ids])
     train_labels = torch.cat([patch_labels[ii] for ii in train_ids]).float()
     if max_negative_ratio is not None:
-        train_features, train_labels = subsample_negatives(
-            train_features, train_labels, max_negative_ratio
-        )
+        keep_ids = subsample_negatives(train_labels, max_negative_ratio)
+        train_features, train_labels = train_features[keep_ids], train_labels[keep_ids]
     mean = train_features.mean(dim=0)
     std = train_features.std(dim=0, correction=0).clamp_min(1e-6)
     coef, intercept = fit_logistic((train_features - mean) / std, train_labels, alpha)
@@ -426,7 +437,6 @@ def fit_predict_segmentation(
 
 
 def subsample_negatives(
-    features: Tensor,
     labels: Tensor,
     max_negative_ratio: float,
 ) -> tuple[Tensor, Tensor]:
@@ -438,7 +448,7 @@ def subsample_negatives(
     generator = torch.Generator().manual_seed(CV_SEED)
     order = torch.randperm(len(negative_ids), generator=generator).to(negative_ids.device)
     keep_ids = torch.cat([positive_ids, negative_ids[order[:n_negative]]])
-    return features[keep_ids], labels[keep_ids]
+    return keep_ids
 
 
 def dice_by_threshold(probabilities: Tensor, labels: Tensor) -> Tensor:

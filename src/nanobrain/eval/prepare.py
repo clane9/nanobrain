@@ -18,7 +18,7 @@ from nibabel.processing import resample_from_to
 from SynthSeg_pytorch import SynthSegPredictor
 from tqdm import tqdm
 
-import nanobrain.utils.preprocessing as preproc
+import nanobrain.eval.preprocessing as preproc
 
 logger = logging.getLogger(__name__)
 

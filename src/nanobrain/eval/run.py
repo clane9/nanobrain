@@ -10,7 +10,7 @@ import torch
 from torch import nn
 
 from nanobrain.eval.tasks import DEFAULT_TASKS, TASKS
-from nanobrain.utils.misc import git_sha
+from nanobrain.eval.misc import git_sha
 
 logger = logging.getLogger(__name__)
 
