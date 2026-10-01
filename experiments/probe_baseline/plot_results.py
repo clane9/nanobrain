@@ -3,7 +3,7 @@ from pathlib import Path
 
 import matplotlib.pyplot as plt
 
-from nanobrain.eval.tasks import TASKS
+from nanobrain.eval.tasks import HEADLINE_METRICS, TASKS
 
 OUTPUT_DIR = Path("output")
 FIGURE_DIR = Path("figures")
@@ -16,7 +16,6 @@ MODELS = [
     "vits_run2_epoch40",
 ]
 MODEL_LABELS = ["raw", "rand", "ep10", "ep20", "ep30", "ep40"]
-HEADLINE_METRICS = ["auroc", "r2", "dice"]
 
 FIGURE_DIR.mkdir(exist_ok=True)
 n_rows = (len(TASKS) + 3) // 4
@@ -26,7 +25,7 @@ for ax in axes.flat[len(TASKS) :]:
 for ax, task in zip(axes.flat, TASKS):
     for ii, model in enumerate(MODELS):
         result = json.loads((OUTPUT_DIR / model / f"{task}.json").read_text())
-        metric = next(metric for metric in HEADLINE_METRICS if metric in result)
+        metric = HEADLINE_METRICS[task]
         low, high = result[f"{metric}_ci"]
         value = result[metric]
         ax.errorbar(ii, value, yerr=[[value - low], [high - value]], fmt="o", capsize=3)

@@ -78,11 +78,10 @@ def select_labels(sample: dict, source_key: str, label_ids: tuple[int, ...]) -> 
     return sample
 
 
-def crop_ap(sample: dict, image_keys: list[str], skull_strip: bool = False) -> dict:
+def strip_and_crop_ap(sample: dict, image_keys: list[str]) -> dict:
     brain = sample["synthseg"] > 0
-    if skull_strip:
-        for key in image_keys:
-            sample[key] = sample[key] * brain
+    for key in image_keys:
+        sample[key] = sample[key] * brain
     brain_ap = np.flatnonzero(brain.any(axis=(0, 2)))
     start = round((brain_ap[0] + brain_ap[-1] - AP_EXTENT_MM) / 2)
     window = np.zeros(brain.shape[1], dtype=bool)
@@ -188,13 +187,7 @@ def fomo_task4_t2w_vessel() -> Probe:
 
 
 def fomo_task5_t1w_cls() -> Probe:
-    transform = partial(crop_ap, image_keys=["t1w", "mask"])
-    dataset = load_dataset("fomo_task5", ["t1w", "mask", "synthseg"], transform)
-    return partial(probe_binary_classification, dataset=dataset, image_key="t1w", label_key="label")
-
-
-def fomo_task5_t1w_cls_stripped() -> Probe:
-    transform = partial(crop_ap, image_keys=["t1w", "mask"], skull_strip=True)
+    transform = partial(strip_and_crop_ap, image_keys=["t1w", "mask"])
     dataset = load_dataset("fomo_task5", ["t1w", "mask", "synthseg"], transform)
     return partial(probe_binary_classification, dataset=dataset, image_key="t1w", label_key="label")
 
@@ -219,7 +212,21 @@ TASKS: dict[str, Callable[[], Probe]] = {
         fomo_task4_t2w_nerve,
         fomo_task4_t2w_vessel,
         fomo_task5_t1w_cls,
-        fomo_task5_t1w_cls_stripped,
         fomo_task5_t1w_cortex,
     ]
+}
+
+HEADLINE_METRICS: dict[str, str] = {
+    "fomo_task1_dwi_cls": "auroc",
+    "fomo_task1_adc_lesion": "voxel_auroc",
+    "fomo_task1_dwi_lesion": "voxel_auroc",
+    "fomo_task2_dwi_tumor": "voxel_auroc",
+    "fomo_task2_flair_tumor": "voxel_auroc",
+    "fomo_task3_t1w_age": "r2",
+    "fomo_task3_t1w_cortex": "dice",
+    "fomo_task3_t1w_hippocampus": "dice",
+    "fomo_task4_t2w_nerve": "dice",
+    "fomo_task4_t2w_vessel": "dice",
+    "fomo_task5_t1w_cls": "auroc",
+    "fomo_task5_t1w_cortex": "dice",
 }
