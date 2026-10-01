@@ -3,7 +3,7 @@ from pathlib import Path
 
 from nanobrain.eval.tasks import TASKS
 
-OUTPUT_DIR = Path("experiments/probe_baseline/output")
+OUTPUT_DIR = Path("output")
 MODELS = [
     "raw_voxel",
     "vits_random_init",
