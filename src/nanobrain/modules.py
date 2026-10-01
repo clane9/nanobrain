@@ -9,6 +9,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch import Tensor
+from torch.nn.attention import SDPBackend, sdpa_kernel
 from jaxtyping import Float
 from timm.layers import DropPath
 
@@ -59,7 +60,8 @@ class Attention(nn.Module):
         q = self.q(x).reshape(B, N, h, D // h).transpose(1, 2)
         k = self.k(context).reshape(B, M, h, D // h).transpose(1, 2)
         v = self.v(context).reshape(B, M, h, D // h).transpose(1, 2)
-        x = F.scaled_dot_product_attention(q, k, v, is_causal=self.causal)
+        with sdpa_kernel(SDPBackend.CUDNN_ATTENTION):
+            x = F.scaled_dot_product_attention(q, k, v, is_causal=self.causal)
         x = x.transpose(1, 2).reshape(B, N, D)
         x = self.proj(x)
         return x
