@@ -53,6 +53,10 @@ if __name__ == "__main__":
     model = load_model(args.ckpt_path).to(args.device)
 
     for task in args.tasks:
+        output_path = args.output_dir / f"{task}.json"
+        if output_path.exists():
+            logger.info(f"skipping {task}, {output_path} exists")
+            continue
         logger.info(f"running {task}")
         start = time.perf_counter()
         result = probe_eval(
@@ -67,6 +71,6 @@ if __name__ == "__main__":
             "total_seconds": time.perf_counter() - start,
             **result,
         }
-        with (args.output_dir / f"{task}.json").open("w") as f:
+        with output_path.open("w") as f:
             json.dump(result, f)
         logger.info(f"{task} done in {result['total_seconds']:.0f}s")

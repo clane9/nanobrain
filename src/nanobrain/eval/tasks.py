@@ -78,8 +78,11 @@ def select_labels(sample: dict, source_key: str, label_ids: tuple[int, ...]) -> 
     return sample
 
 
-def crop_ap(sample: dict, image_keys: list[str]) -> dict:
+def crop_ap(sample: dict, image_keys: list[str], skull_strip: bool = False) -> dict:
     brain = sample["synthseg"] > 0
+    if skull_strip:
+        for key in image_keys:
+            sample[key] = sample[key] * brain
     brain_ap = np.flatnonzero(brain.any(axis=(0, 2)))
     start = round((brain_ap[0] + brain_ap[-1] - AP_EXTENT_MM) / 2)
     window = np.zeros(brain.shape[1], dtype=bool)
@@ -190,6 +193,12 @@ def fomo_task5_t1w_cls() -> Probe:
     return partial(probe_binary_classification, dataset=dataset, image_key="t1w", label_key="label")
 
 
+def fomo_task5_t1w_cls_stripped() -> Probe:
+    transform = partial(crop_ap, image_keys=["t1w", "mask"], skull_strip=True)
+    dataset = load_dataset("fomo_task5", ["t1w", "mask", "synthseg"], transform)
+    return partial(probe_binary_classification, dataset=dataset, image_key="t1w", label_key="label")
+
+
 def fomo_task5_t1w_cortex() -> Probe:
     transform = partial(select_labels, source_key="synthseg", label_ids=SYNTHSEG_CORTEX)
     dataset = load_dataset("fomo_task5", ["t1w", "mask", "synthseg"], transform)
@@ -210,6 +219,7 @@ TASKS: dict[str, Callable[[], Probe]] = {
         fomo_task4_t2w_nerve,
         fomo_task4_t2w_vessel,
         fomo_task5_t1w_cls,
+        fomo_task5_t1w_cls_stripped,
         fomo_task5_t1w_cortex,
     ]
 }
