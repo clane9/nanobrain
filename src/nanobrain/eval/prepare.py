@@ -33,9 +33,13 @@ VMAX_QUANTILE = 0.995
 def prepare_fomo_task1(num_workers: int, device: str) -> hfds.Dataset:
     task_dir = fetch_fomo_task(1)
     subjects = sorted(path.name for path in (task_dir / "preprocessed").iterdir())
-    prepare_subject = partial(prepare_fomo_task1_subject, task_dir, device=device)
+    prepare_subject = partial(prepare_fomo_task1_subject, task_dir)
     with ProcessPoolExecutor(num_workers) as executor:
         rows = list(tqdm(executor.map(prepare_subject, subjects), total=len(subjects)))
+
+    for row in tqdm(rows, desc="synthseg"):
+        reference_img = decode_nifti_zst(row["flair"])
+        row["synthseg"] = encode_nifti_zst(run_synthseg(reference_img, device=device))
 
     features = hfds.Features(
         {
@@ -52,7 +56,7 @@ def prepare_fomo_task1(num_workers: int, device: str) -> hfds.Dataset:
     return hfds.Dataset.from_list(rows, features=features)
 
 
-def prepare_fomo_task1_subject(task_dir: Path, subject: str, device: str) -> dict:
+def prepare_fomo_task1_subject(task_dir: Path, subject: str) -> dict:
     label = int((task_dir / "labels" / subject / "ses-01" / "label.txt").read_text())
     images = {
         modality: nib.load(task_dir / "preprocessed" / subject / "ses-01" / f"{modality}.nii.gz")
@@ -61,16 +65,20 @@ def prepare_fomo_task1_subject(task_dir: Path, subject: str, device: str) -> dic
     seg_path = task_dir / "labels" / subject / "ses-01" / "seg.nii.gz"
     assert seg_path.exists() == (label == 1), f"{subject}: seg does not match label"
     segs = {"seg": nib.load(seg_path) if label == 1 else None}
-    encoded = prepare_images(images, segs, reference="flair", device=device)
+    encoded = prepare_images(images, segs, reference="flair")
     return {"subject": subject, "label": label, **encoded}
 
 
 def prepare_fomo_task2(num_workers: int, device: str) -> hfds.Dataset:
     task_dir = fetch_fomo_task(2)
     subjects = sorted(path.name for path in (task_dir / "preprocessed").iterdir())
-    prepare_subject = partial(prepare_fomo_task2_subject, task_dir, device=device)
+    prepare_subject = partial(prepare_fomo_task2_subject, task_dir)
     with ProcessPoolExecutor(num_workers) as executor:
         rows = list(tqdm(executor.map(prepare_subject, subjects), total=len(subjects)))
+
+    for row in tqdm(rows, desc="synthseg"):
+        reference_img = decode_nifti_zst(row["flair"])
+        row["synthseg"] = encode_nifti_zst(run_synthseg(reference_img, device=device))
 
     features = hfds.Features(
         {
@@ -85,22 +93,26 @@ def prepare_fomo_task2(num_workers: int, device: str) -> hfds.Dataset:
     return hfds.Dataset.from_list(rows, features=features)
 
 
-def prepare_fomo_task2_subject(task_dir: Path, subject: str, device: str) -> dict:
+def prepare_fomo_task2_subject(task_dir: Path, subject: str) -> dict:
     images = {
         modality: nib.load(task_dir / "preprocessed" / subject / "ses-01" / f"{modality}.nii.gz")
         for modality in ("dwi_b1000", "flair")
     }
     segs = {"seg": nib.load(task_dir / "labels" / subject / "ses-01" / "seg.nii.gz")}
-    encoded = prepare_images(images, segs, reference="flair", device=device)
+    encoded = prepare_images(images, segs, reference="flair")
     return {"subject": subject, **encoded}
 
 
 def prepare_fomo_task3(num_workers: int, device: str) -> hfds.Dataset:
     task_dir = fetch_fomo_task(3)
     subjects = sorted(path.name for path in (task_dir / "preprocessed").iterdir())
-    prepare_subject = partial(prepare_fomo_task3_subject, task_dir, device=device)
+    prepare_subject = partial(prepare_fomo_task3_subject, task_dir)
     with ProcessPoolExecutor(num_workers) as executor:
         rows = list(tqdm(executor.map(prepare_subject, subjects), total=len(subjects)))
+
+    for row in tqdm(rows, desc="synthseg"):
+        reference_img = decode_nifti_zst(row["t1w"])
+        row["synthseg"] = encode_nifti_zst(run_synthseg(reference_img, device=device))
 
     features = hfds.Features(
         {
@@ -114,19 +126,23 @@ def prepare_fomo_task3(num_workers: int, device: str) -> hfds.Dataset:
     return hfds.Dataset.from_list(rows, features=features)
 
 
-def prepare_fomo_task3_subject(task_dir: Path, subject: str, device: str) -> dict:
+def prepare_fomo_task3_subject(task_dir: Path, subject: str) -> dict:
     age = float((task_dir / "labels" / subject / "ses-01" / "labels.txt").read_text())
     images = {"t1w": nib.load(task_dir / "preprocessed" / subject / "ses-01" / "t1w.nii.gz")}
-    encoded = prepare_images(images, {}, reference="t1w", device=device)
+    encoded = prepare_images(images, {}, reference="t1w")
     return {"subject": subject, "age": age, **encoded}
 
 
 def prepare_fomo_task4(num_workers: int, device: str) -> hfds.Dataset:
     task_dir = fetch_fomo_task(4)
     subjects = sorted(path.name for path in (task_dir / "preprocessed").iterdir())
-    prepare_subject = partial(prepare_fomo_task4_subject, task_dir, device=device)
+    prepare_subject = partial(prepare_fomo_task4_subject, task_dir)
     with ProcessPoolExecutor(num_workers) as executor:
         rows = list(tqdm(executor.map(prepare_subject, subjects), total=len(subjects)))
+
+    for row in tqdm(rows, desc="synthseg"):
+        reference_img = decode_nifti_zst(row["t2w"])
+        row["synthseg"] = encode_nifti_zst(run_synthseg(reference_img, device=device))
 
     features = hfds.Features(
         {
@@ -140,19 +156,23 @@ def prepare_fomo_task4(num_workers: int, device: str) -> hfds.Dataset:
     return hfds.Dataset.from_list(rows, features=features)
 
 
-def prepare_fomo_task4_subject(task_dir: Path, subject: str, device: str) -> dict:
+def prepare_fomo_task4_subject(task_dir: Path, subject: str) -> dict:
     images = {"t2w": nib.load(task_dir / "preprocessed" / subject / "ses-01" / "t2w.nii.gz")}
     segs = {"seg": nib.load(task_dir / "labels" / subject / "ses-01" / "seg.nii.gz")}
-    encoded = prepare_images(images, segs, reference="t2w", device=device)
+    encoded = prepare_images(images, segs, reference="t2w")
     return {"subject": subject, **encoded}
 
 
 def prepare_fomo_task5(num_workers: int, device: str) -> hfds.Dataset:
     task_dir = fetch_fomo_task(5)
     subjects = sorted(path.name for path in (task_dir / "preprocessed").iterdir())
-    prepare_subject = partial(prepare_fomo_task5_subject, task_dir, device=device)
+    prepare_subject = partial(prepare_fomo_task5_subject, task_dir)
     with ProcessPoolExecutor(num_workers) as executor:
         rows = list(tqdm(executor.map(prepare_subject, subjects), total=len(subjects)))
+
+    for row in tqdm(rows, desc="synthseg"):
+        reference_img = decode_nifti_zst(row["t1w"])
+        row["synthseg"] = encode_nifti_zst(run_synthseg(reference_img, device=device))
 
     features = hfds.Features(
         {
@@ -166,10 +186,10 @@ def prepare_fomo_task5(num_workers: int, device: str) -> hfds.Dataset:
     return hfds.Dataset.from_list(rows, features=features)
 
 
-def prepare_fomo_task5_subject(task_dir: Path, subject: str, device: str) -> dict:
+def prepare_fomo_task5_subject(task_dir: Path, subject: str) -> dict:
     label = int((task_dir / "labels" / subject / "ses_01" / "labels.txt").read_text())
     images = {"t1w": nib.load(task_dir / "preprocessed" / subject / "ses_01" / "t1.nii.gz")}
-    encoded = prepare_images(images, {}, reference="t1w", device=device)
+    encoded = prepare_images(images, {}, reference="t1w")
     return {"subject": subject, "label": label, **encoded}
 
 
@@ -217,12 +237,11 @@ def prepare_images(
     images: dict[str, nib.Nifti1Image],
     segs: dict[str, nib.Nifti1Image | None],
     reference: str,
-    device: str = "cuda",
 ) -> dict[str, bytes | None]:
     """
     Conform all images to the fixed 1mm grid using one head mask from the reference image.
     Images are clipped and scaled to uint16 inside the mask like prepare.py, zero outside.
-    Also runs SynthSeg on the conformed reference. Missing segs stay None.
+    Missing segs stay None.
     """
     mask_img = preproc.threshold_mask(images[reference])
     reference_img = preproc.conform_image(
@@ -240,8 +259,6 @@ def prepare_images(
         assert np.allclose(fit_img.affine, affine, atol=1e-3), f"{key} grid mismatch"
         fit_img = truncate_image(fit_img, fit_mask_img, (VMIN_QUANTILE, VMAX_QUANTILE))
         encoded[key] = encode_nifti_zst(fit_img)
-        if key == reference:
-            encoded["synthseg"] = encode_nifti_zst(run_synthseg(fit_img, device=device))
 
     for key, img in segs.items():
         if img is None:
@@ -286,6 +303,10 @@ def truncate_image(
 
 def encode_nifti_zst(img: nib.Nifti1Image) -> bytes:
     return zstandard.compress(img.to_bytes())
+
+
+def decode_nifti_zst(data: bytes) -> nib.Nifti1Image:
+    return nib.Nifti1Image.from_bytes(zstandard.decompress(data))
 
 
 if __name__ == "__main__":
