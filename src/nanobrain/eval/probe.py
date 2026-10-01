@@ -22,6 +22,8 @@ LOGISTIC_CS = np.logspace(-4, 4, 9)
 RIDGE_ALPHAS = np.logspace(-2, 6, 9)
 SEGMENTATION_ALPHAS = (1e1, 1e2, 1e3, 1e4, 1e5)
 SEGMENTATION_THRESHOLDS = torch.logspace(-3, -0.1, 30)
+HISTOGRAM_BINS = 32
+HISTOGRAM_RANGE = (-4.0, 4.0)
 
 
 class Encoder(nn.Module):
@@ -36,6 +38,58 @@ class Encoder(nn.Module):
         images: Float[Tensor, "B X Y Z"],
         mask: Float[Tensor, "B X Y Z"],
     ) -> Float[Tensor, "B Gx Gy Gz C"]: ...
+
+
+class RawVoxelEncoder(nn.Module):
+    """Baseline with no learned features. Dense is the raw patch voxels, global is the mask
+    volume and an intensity histogram."""
+
+    def __init__(self, patch_size: int = 8):
+        super().__init__()
+        self.patch_size = patch_size
+
+    @classmethod
+    def from_config(cls, args: dict) -> "RawVoxelEncoder":
+        return cls(patch_size=args["patch_size"])
+
+    def dense_embed(
+        self,
+        images: Float[Tensor, "B X Y Z"],
+        mask: Float[Tensor, "B X Y Z"],
+    ) -> Float[Tensor, "B Gx Gy Gz P"]:
+        B, X, Y, Z = images.shape
+        p = self.patch_size
+        embeds = images.new_zeros(B, (X // p) * (Y // p) * (Z // p), p**3)
+        for ii in range(B):
+            image_mask = mask[ii] > 0
+            values = images[ii][image_mask]
+            values = values / values.max()
+            values = (values - values.mean()) / values.std(correction=0).clamp_min(1e-6)
+            image = torch.zeros_like(images[ii])
+            image[image_mask] = values
+
+            patches = patchify3d(image[None], p)
+            in_mask = patchify3d(image_mask[None], p).any(dim=2)[0]
+            embeds[ii, in_mask] = patches[0, in_mask]
+
+        embeds = embeds.reshape(B, X // p, Y // p, Z // p, p**3)
+        return embeds
+
+    def global_embed(
+        self,
+        images: Float[Tensor, "B X Y Z"],
+        mask: Float[Tensor, "B X Y Z"],
+    ) -> Float[Tensor, "B D"]:
+        embeds = []
+        for image, image_mask in zip(images, mask):
+            values = image[image_mask > 0].float()
+            values = (values - values.mean()) / values.std(correction=0).clamp_min(1e-6)
+            low, high = HISTOGRAM_RANGE
+            histogram = torch.histc(values, bins=HISTOGRAM_BINS, min=low, max=high) / len(values)
+            # 1mm grid, so the voxel count is the volume in mm3
+            volume_ml = torch.tensor([len(values) / 1000], device=values.device)
+            embeds.append(torch.cat([volume_ml, histogram]))
+        return torch.stack(embeds)
 
 
 def probe_binary_classification(
@@ -208,6 +262,7 @@ def probe_binary_segmentation(
     mask_key: str = "mask",
     n_folds: int = 5,
     n_inner_folds: int = 5,
+    max_negative_ratio: float | None = None,
     batch_size: int = 4,
     num_workers: int = 8,
     device: str = "cuda",
@@ -267,7 +322,12 @@ def probe_binary_segmentation(
             inner_val_ids = train_ids[inner_val]
             for alpha_id, alpha in enumerate(SEGMENTATION_ALPHAS):
                 probabilities = fit_predict_segmentation(
-                    patch_features, patch_labels, inner_train_ids, inner_val_ids, alpha
+                    patch_features,
+                    patch_labels,
+                    inner_train_ids,
+                    inner_val_ids,
+                    alpha,
+                    max_negative_ratio,
                 )
                 for ii, subject_probabilities in zip(inner_val_ids, probabilities):
                     inner_dice[alpha_id, ii] = dice_by_threshold(
@@ -283,7 +343,7 @@ def probe_binary_segmentation(
         fold_thresholds.append(SEGMENTATION_THRESHOLDS[threshold_id].item())
 
         probabilities = fit_predict_segmentation(
-            patch_features, patch_labels, train_ids, test_ids, alpha
+            patch_features, patch_labels, train_ids, test_ids, alpha, max_negative_ratio
         )
         for ii, subject_probabilities in zip(test_ids, probabilities):
             dice = dice_by_threshold(subject_probabilities, patch_labels[ii])
@@ -322,10 +382,23 @@ def fit_predict_segmentation(
     train_ids: np.ndarray,
     test_ids: np.ndarray,
     alpha: float,
+    max_negative_ratio: float | None = None,
 ) -> list[Tensor]:
     """Fit on the train subjects' patches, return per-patch probabilities for each test subject."""
     train_features = torch.cat([patch_features[ii] for ii in train_ids])
     train_labels = torch.cat([patch_labels[ii] for ii in train_ids]).float()
+
+    # subsample training patches with no positive voxels, keeping every positive patch
+    if max_negative_ratio is not None:
+        positive = train_labels.sum(dim=1) > 0
+        positive_ids = positive.nonzero()[:, 0]
+        negative_ids = (~positive).nonzero()[:, 0]
+        n_negative = min(len(negative_ids), int(max_negative_ratio * len(positive_ids)))
+        generator = torch.Generator().manual_seed(CV_SEED)
+        order = torch.randperm(len(negative_ids), generator=generator).to(negative_ids.device)
+        keep_ids = torch.cat([positive_ids, negative_ids[order[:n_negative]]])
+        train_features = train_features[keep_ids]
+        train_labels = train_labels[keep_ids]
     mean = train_features.mean(dim=0)
     std = train_features.std(dim=0, correction=0).clamp_min(1e-6)
     coef, intercept = fit_logistic((train_features - mean) / std, train_labels, alpha)

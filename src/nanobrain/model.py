@@ -28,6 +28,7 @@ class ViTMAE3D(nn.Module):
         super().__init__()
         self.grid_size = grid_size
         self.patch_size = patch_size
+        self.embed_dim = embed_dim
         self.class_tokens = class_tokens
         patch_grid_size = tuple(size // patch_size for size in grid_size)
 
@@ -81,6 +82,14 @@ class ViTMAE3D(nn.Module):
         self.decoder_norm = LayerNorm(decoder_embed_dim)
         self.decoder_head = nn.Linear(decoder_embed_dim, patch_dim)
         self.init_weights()
+
+    @classmethod
+    def from_config(cls, args: dict) -> "ViTMAE3D":
+        return cls(
+            grid_size=tuple(args["grid_size"]),
+            patch_size=args["patch_size"],
+            **args["model_kwargs"],
+        )
 
     def extra_repr(self):
         return f"{self.grid_size}, {self.patch_size}, class_tokens={self.class_tokens}"
@@ -192,6 +201,43 @@ class ViTMAE3D(nn.Module):
             "image_ids": image_ids,
         }
         return loss, state
+
+    def dense_embed(
+        self,
+        images: Float[Tensor, "B X Y Z"],
+        mask: Float[Tensor, "B X Y Z"],
+    ) -> Float[Tensor, "B Gx Gy Gz D"]:
+        B = images.shape[0]
+        assert tuple(images.shape[1:]) == tuple(self.grid_size)
+        patch_grid_size = [size // self.patch_size for size in self.grid_size]
+        embeds = images.new_zeros(B, self.coord_grid.shape[1], self.embed_dim)
+
+        # one forward per image since the number of patches in the mask varies
+        for ii in range(B):
+            image_mask = mask[ii] > 0
+            values = images[ii][image_mask]
+            values = values / values.max()
+            values = (values - values.mean()) / values.std(correction=0).clamp_min(1e-6)
+            image = torch.zeros_like(images[ii])
+            image[image_mask] = values
+
+            patches = patchify3d(image[None], self.patch_size)
+            in_mask = patchify3d(image_mask[None], self.patch_size).any(dim=2)[0]
+            x = self.forward_encoder(patches[:, in_mask], self.coord_grid[:, in_mask])
+            embeds[ii, in_mask] = x[0, self.class_tokens :].to(embeds.dtype)
+
+        embeds = embeds.reshape(B, *patch_grid_size, self.embed_dim)
+        return embeds
+
+    def global_embed(
+        self,
+        images: Float[Tensor, "B X Y Z"],
+        mask: Float[Tensor, "B X Y Z"],
+    ) -> Float[Tensor, "B D"]:
+        embeds = self.dense_embed(images, mask).flatten(1, 3)
+        in_mask = patchify3d(mask > 0, self.patch_size).any(dim=2)
+        embeds = (embeds * in_mask[..., None]).sum(dim=1) / in_mask.sum(dim=1, keepdim=True)
+        return embeds
 
 
 def patchify3d(x: Tensor, patch_size: int = 8) -> Tensor:

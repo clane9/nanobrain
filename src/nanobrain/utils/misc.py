@@ -312,6 +312,8 @@ def save_model(args, epoch, model_without_ddp, optimizer, loss_scaler):
         "epoch": epoch,
         "scaler": None if loss_scaler is None else loss_scaler.state_dict(),
         "args": OmegaConf.to_container(args),
+        "model_class": f"{type(model_without_ddp).__module__}:{type(model_without_ddp).__name__}",
+        "git_sha": git_sha(),
     }
 
     logger.info(f"saving checkpoint {last_checkpoint_path}")

@@ -79,11 +79,7 @@ def main(args: DictConfig):
     )
 
     # model
-    model = ViTMAE3D(
-        grid_size=tuple(args.grid_size),
-        patch_size=args.patch_size,
-        **args.model_kwargs,
-    )
+    model = ViTMAE3D.from_config(args)
     model.to(device)
     logger.info(f"model:\n{model}")
     num_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
