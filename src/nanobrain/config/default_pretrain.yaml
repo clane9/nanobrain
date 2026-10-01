@@ -1,11 +1,11 @@
 # Name of the run. Used for output directory suffix and wandb.
-name: pretrain
+name: nanobrain
 
 # Description of the run. Goes in wandb notes.
 notes: null
 
 # Root output directory. The run writes to <output_dir>/<name> when name is set.
-output_dir: checkpoints
+output_dir: output
 
 # Data.
 data_root: data/FOMO300K_images
