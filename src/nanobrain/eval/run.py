@@ -9,7 +9,7 @@ from typing import Any
 import torch
 from torch import nn
 
-from nanobrain.eval.tasks import TASKS
+from nanobrain.eval.tasks import DEFAULT_TASKS, TASKS
 from nanobrain.utils.misc import git_sha
 
 logger = logging.getLogger(__name__)
@@ -40,7 +40,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("ckpt_path", type=Path)
     parser.add_argument("output_dir", type=Path)
-    parser.add_argument("--tasks", nargs="+", choices=list(TASKS), default=list(TASKS))
+    parser.add_argument("--tasks", nargs="+", choices=list(TASKS), default=DEFAULT_TASKS)
     parser.add_argument("--batch-size", type=int, default=4)
     parser.add_argument("--num-workers", type=int, default=8)
     parser.add_argument("--device", type=str, default="cuda")
