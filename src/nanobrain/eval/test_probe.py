@@ -75,7 +75,7 @@ class DummyEncoder(nn.Module):
 
 
 def test_probe_binary_classification():
-    record = probe_binary_classification(
+    record, _ = probe_binary_classification(
         DummyEncoder().cuda(), DummyDataset(40), image_key="t1w", label_key="label"
     )
     assert record["auroc"] > 0.95
@@ -85,7 +85,7 @@ def test_probe_binary_classification():
 
 
 def test_probe_binary_classification_random_labels():
-    record = probe_binary_classification(
+    record, _ = probe_binary_classification(
         DummyEncoder().cuda(), DummyDataset(40), image_key="t1w", label_key="random_label"
     )
     low, high = record["auroc_ci"]
@@ -93,7 +93,7 @@ def test_probe_binary_classification_random_labels():
 
 
 def test_probe_regression():
-    record = probe_regression(
+    record, _ = probe_regression(
         DummyEncoder().cuda(), DummyDataset(40), image_key="t1w", target_key="age"
     )
     assert record["r"] > 0.9
@@ -101,10 +101,11 @@ def test_probe_regression():
 
 
 def test_probe_binary_segmentation():
-    record = probe_binary_segmentation(
+    record, _ = probe_binary_segmentation(
         DummyEncoder().cuda(), DummyDataset(20), image_key="t1w", label_key="lesion"
     )
     assert record["dice"] > 0.9
     assert record["average_precision"] > 0.9
+    assert record["voxel_auroc"] > 0.9
     assert record["embed_dim"] == 512
     assert len(record["subject_dice"]) == 20

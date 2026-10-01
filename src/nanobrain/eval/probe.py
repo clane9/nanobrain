@@ -103,7 +103,7 @@ def probe_binary_classification(
     num_workers: int = 8,
     device: str = "cuda",
     amp: bool = True,
-) -> dict[str, Any]:
+) -> tuple[dict[str, Any], dict[str, Any]]:
     """
     Linear probe for binary classification on the global embedding. Logistic regression with
     the penalty tuned by inner CV. Scores pooled out-of-fold predictions with bootstrap CIs.
@@ -164,7 +164,7 @@ def probe_binary_classification(
         bootstrap_auroc.append(roc_auc_score(labels[ids], probabilities[ids]))
         bootstrap_balanced_accuracy.append(balanced_accuracy_score(labels[ids], predictions[ids]))
 
-    return {
+    result = {
         "auroc": roc_auc_score(labels, probabilities),
         "auroc_ci": np.percentile(bootstrap_auroc, [2.5, 97.5]).tolist(),
         "balanced_accuracy": balanced_accuracy_score(labels, predictions),
@@ -177,6 +177,8 @@ def probe_binary_classification(
         "n_params": sum(p.numel() for p in model.parameters()),
         "embed_seconds": embed_seconds,
     }
+    state = {"features": features}
+    return result, state
 
 
 def probe_regression(
@@ -190,7 +192,7 @@ def probe_regression(
     num_workers: int = 8,
     device: str = "cuda",
     amp: bool = True,
-) -> dict[str, Any]:
+) -> tuple[dict[str, Any], dict[str, Any]]:
     """
     Linear probe for regression on the global embedding. Ridge regression with the penalty
     tuned by leave-one-out. Scores pooled out-of-fold predictions with bootstrap CIs.
@@ -237,7 +239,7 @@ def probe_regression(
         bootstrap_r.append(np.corrcoef(targets[ids], predictions[ids])[0, 1])
         bootstrap_r2.append(r2_score(targets[ids], predictions[ids]))
 
-    return {
+    result = {
         "mae": mean_absolute_error(targets, predictions),
         "mae_ci": np.percentile(bootstrap_mae, [2.5, 97.5]).tolist(),
         "r": np.corrcoef(targets, predictions)[0, 1],
@@ -252,6 +254,8 @@ def probe_regression(
         "n_params": sum(p.numel() for p in model.parameters()),
         "embed_seconds": embed_seconds,
     }
+    state = {"features": features}
+    return result, state
 
 
 def probe_binary_segmentation(
@@ -267,7 +271,7 @@ def probe_binary_segmentation(
     num_workers: int = 8,
     device: str = "cuda",
     amp: bool = True,
-) -> dict[str, Any]:
+) -> tuple[dict[str, Any], dict[str, Any]]:
     """
     Linear probe for binary segmentation on the dense embedding. Each patch embedding predicts
     the 8x8x8 voxel labels inside its patch, so predictions are at full 1mm resolution. The
@@ -279,6 +283,7 @@ def probe_binary_segmentation(
     loader = DataLoader(dataset, batch_size=batch_size, num_workers=num_workers)
     patch_features = []
     patch_labels = []
+    patch_in_mask = []
     embed_seconds = 0.0
     with torch.inference_mode(), torch.autocast(device_type, dtype=torch.bfloat16, enabled=amp):
         for batch in loader:
@@ -303,6 +308,7 @@ def probe_binary_segmentation(
             # keep only patches that overlap the mask, assuming no labels outside it
             for ii in range(len(images)):
                 in_mask = mask_patches[ii].any(dim=1)
+                patch_in_mask.append(in_mask.cpu())
                 patch_features.append(embedding[ii, in_mask])
                 patch_labels.append(label_patches[ii, in_mask])
     embed_dim = patch_features[0].shape[1]
@@ -311,10 +317,13 @@ def probe_binary_segmentation(
     n_thresholds = len(SEGMENTATION_THRESHOLDS)
     subject_dice = np.zeros(n_subjects)
     subject_average_precision = np.zeros(n_subjects)
+    subject_voxel_auroc = np.zeros(n_subjects)
+    subject_probabilities_out_of_fold = [None] * n_subjects
+    subject_fold = np.zeros(n_subjects, dtype=int)
     fold_alphas = []
     fold_thresholds = []
     folds = KFold(n_folds, shuffle=True, random_state=CV_SEED)
-    for train_ids, test_ids in folds.split(np.arange(n_subjects)):
+    for fold, (train_ids, test_ids) in enumerate(folds.split(np.arange(n_subjects))):
         inner_dice = torch.zeros(len(SEGMENTATION_ALPHAS), n_subjects, n_thresholds)
         inner_folds = KFold(n_inner_folds, shuffle=True, random_state=CV_SEED)
         for inner_train, inner_val in inner_folds.split(train_ids):
@@ -346,34 +355,48 @@ def probe_binary_segmentation(
             patch_features, patch_labels, train_ids, test_ids, alpha, max_negative_ratio
         )
         for ii, subject_probabilities in zip(test_ids, probabilities):
+            subject_probabilities_out_of_fold[ii] = subject_probabilities.cpu()
+            subject_fold[ii] = fold
             dice = dice_by_threshold(subject_probabilities, patch_labels[ii])
             subject_dice[ii] = dice[threshold_id].item()
             subject_average_precision[ii] = average_precision(
                 subject_probabilities, patch_labels[ii]
             )
+            subject_voxel_auroc[ii] = voxel_auroc(subject_probabilities, patch_labels[ii])
 
     rng = np.random.default_rng(0)
     bootstrap_dice = []
     bootstrap_average_precision = []
+    bootstrap_voxel_auroc = []
     for _ in range(N_BOOTSTRAP):
         ids = rng.integers(0, n_subjects, n_subjects)
         bootstrap_dice.append(subject_dice[ids].mean())
         bootstrap_average_precision.append(np.nanmean(subject_average_precision[ids]))
+        bootstrap_voxel_auroc.append(np.nanmean(subject_voxel_auroc[ids]))
 
-    return {
+    result = {
         "dice": subject_dice.mean(),
         "dice_ci": np.percentile(bootstrap_dice, [2.5, 97.5]).tolist(),
         "average_precision": np.nanmean(subject_average_precision),
         "average_precision_ci": np.nanpercentile(bootstrap_average_precision, [2.5, 97.5]).tolist(),
+        "voxel_auroc": np.nanmean(subject_voxel_auroc),
+        "voxel_auroc_ci": np.nanpercentile(bootstrap_voxel_auroc, [2.5, 97.5]).tolist(),
         "fold_alpha": fold_alphas,
         "fold_threshold": fold_thresholds,
         "subject_dice": subject_dice.tolist(),
         "subject_average_precision": subject_average_precision.tolist(),
+        "subject_voxel_auroc": subject_voxel_auroc.tolist(),
         "n_samples": n_subjects,
         "embed_dim": embed_dim,
         "n_params": sum(p.numel() for p in model.parameters()),
         "embed_seconds": embed_seconds,
     }
+    state = {
+        "in_mask": patch_in_mask,
+        "probabilities": subject_probabilities_out_of_fold,
+        "fold": subject_fold,
+    }
+    return result, state
 
 
 def fit_predict_segmentation(
@@ -387,18 +410,10 @@ def fit_predict_segmentation(
     """Fit on the train subjects' patches, return per-patch probabilities for each test subject."""
     train_features = torch.cat([patch_features[ii] for ii in train_ids])
     train_labels = torch.cat([patch_labels[ii] for ii in train_ids]).float()
-
-    # subsample training patches with no positive voxels, keeping every positive patch
     if max_negative_ratio is not None:
-        positive = train_labels.sum(dim=1) > 0
-        positive_ids = positive.nonzero()[:, 0]
-        negative_ids = (~positive).nonzero()[:, 0]
-        n_negative = min(len(negative_ids), int(max_negative_ratio * len(positive_ids)))
-        generator = torch.Generator().manual_seed(CV_SEED)
-        order = torch.randperm(len(negative_ids), generator=generator).to(negative_ids.device)
-        keep_ids = torch.cat([positive_ids, negative_ids[order[:n_negative]]])
-        train_features = train_features[keep_ids]
-        train_labels = train_labels[keep_ids]
+        train_features, train_labels = subsample_negatives(
+            train_features, train_labels, max_negative_ratio
+        )
     mean = train_features.mean(dim=0)
     std = train_features.std(dim=0, correction=0).clamp_min(1e-6)
     coef, intercept = fit_logistic((train_features - mean) / std, train_labels, alpha)
@@ -410,6 +425,22 @@ def fit_predict_segmentation(
     return probabilities
 
 
+def subsample_negatives(
+    features: Tensor,
+    labels: Tensor,
+    max_negative_ratio: float,
+) -> tuple[Tensor, Tensor]:
+    """Keep every row with a positive label and at most max_negative_ratio negatives per positive."""
+    positive = labels.sum(dim=1) > 0
+    positive_ids = positive.nonzero()[:, 0]
+    negative_ids = (~positive).nonzero()[:, 0]
+    n_negative = min(len(negative_ids), int(max_negative_ratio * len(positive_ids)))
+    generator = torch.Generator().manual_seed(CV_SEED)
+    order = torch.randperm(len(negative_ids), generator=generator).to(negative_ids.device)
+    keep_ids = torch.cat([positive_ids, negative_ids[order[:n_negative]]])
+    return features[keep_ids], labels[keep_ids]
+
+
 def dice_by_threshold(probabilities: Tensor, labels: Tensor) -> Tensor:
     """Dice at each of SEGMENTATION_THRESHOLDS. Empty prediction and empty label counts as 1."""
     thresholds = SEGMENTATION_THRESHOLDS.to(probabilities.device)
@@ -418,6 +449,21 @@ def dice_by_threshold(probabilities: Tensor, labels: Tensor) -> Tensor:
     denominator = predicted.sum(dim=1) + labels.sum()
     dice = torch.where(denominator > 0, 2 * overlap / denominator.clamp_min(1), 1.0)
     return dice.cpu()
+
+
+def voxel_auroc(probabilities: Tensor, labels: Tensor) -> float:
+    """Voxel AUROC from ranks, NaN when there are no positives. Ties are not merged."""
+    positive = labels.flatten().bool()
+    n_positive = positive.sum().item()
+    if n_positive == 0:
+        return np.nan
+    n_negative = len(positive) - n_positive
+    ranks = torch.empty(len(positive), dtype=torch.float64, device=positive.device)
+    ranks[probabilities.flatten().argsort()] = torch.arange(
+        1, len(positive) + 1, dtype=torch.float64, device=positive.device
+    )
+    rank_sum = ranks[positive].sum().item()
+    return (rank_sum - n_positive * (n_positive + 1) / 2) / (n_positive * n_negative)
 
 
 def average_precision(probabilities: Tensor, labels: Tensor) -> float:

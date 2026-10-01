@@ -31,7 +31,7 @@ def probe_eval(
     num_workers: int = 8,
     device: str = "cuda",
     amp: bool = True,
-) -> dict[str, Any]:
+) -> tuple[dict[str, Any], dict[str, Any]]:
     probe = TASKS[task]()
     return probe(model, batch_size=batch_size, num_workers=num_workers, device=device, amp=amp)
 
@@ -59,7 +59,7 @@ if __name__ == "__main__":
             continue
         logger.info(f"running {task}")
         start = time.perf_counter()
-        result = probe_eval(
+        result, _ = probe_eval(
             model, task, args.batch_size, args.num_workers, args.device, not args.no_amp
         )
         result = {
