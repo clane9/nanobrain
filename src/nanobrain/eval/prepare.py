@@ -24,6 +24,7 @@ logger = logging.getLogger(__name__)
 
 EVAL_ROOT = Path(os.getenv("NANOBRAIN_EVAL_ROOT", "data/eval"))
 FOMO_RAW_ROOT = Path(os.getenv("FOMO_RAW_ROOT", "data/eval_raw/fomo"))
+UCSF_BMSR_RAW_ROOT = Path(os.getenv("UCSF_BMSR_RAW_ROOT", "data/eval_raw/ucsf_bmsr"))
 FOMO_URL = "https://sid.erda.dk/share_redirect/fmeuvo1EdF"
 GRID_FOV = (192.0, 240.0, 192.0)
 VMIN_QUANTILE = 0.005
@@ -193,12 +194,46 @@ def prepare_fomo_task5_subject(task_dir: Path, subject: str) -> dict:
     return {"subject": subject, "label": label, **encoded}
 
 
+def prepare_ucsf_bmsr(num_workers: int, device: str) -> hfds.Dataset:
+    # one visit per patient, visit 100101A is stored as sub-100101/ses-A
+    subjects = sorted(
+        f"{session.parent.name.removeprefix('sub-')}{session.name.removeprefix('ses-')}"
+        for session in (UCSF_BMSR_RAW_ROOT / "images").glob("sub-*/ses-*")
+    )
+    with ProcessPoolExecutor(num_workers) as executor:
+        rows = list(tqdm(executor.map(prepare_ucsf_bmsr_subject, subjects), total=len(subjects)))
+
+    features = hfds.Features(
+        {
+            "subject": hfds.Value("string"),
+            "mask": hfds.Value("large_binary"),
+            "t1c": hfds.Value("large_binary"),
+            "flair": hfds.Value("large_binary"),
+            "seg": hfds.Value("large_binary"),
+        }
+    )
+    return hfds.Dataset.from_list(rows, features=features)
+
+
+def prepare_ucsf_bmsr_subject(subject: str) -> dict:
+    sub, ses = f"sub-{subject[:-1]}", f"ses-{subject[-1]}"
+    images = {
+        modality: nib.load(UCSF_BMSR_RAW_ROOT / "images" / sub / ses / f"{modality}.nii.gz")
+        for modality in ("t1c", "flair")
+    }
+    # 2 edema (drawn on flair), 3 enhancing tumor
+    segs = {"seg": nib.load(UCSF_BMSR_RAW_ROOT / "labels" / sub / ses / "seg.nii.gz")}
+    encoded = prepare_images(images, segs, reference="t1c")
+    return {"subject": subject, **encoded}
+
+
 PREPARE_FUNCTIONS = {
     "fomo_task1": prepare_fomo_task1,
     "fomo_task2": prepare_fomo_task2,
     "fomo_task3": prepare_fomo_task3,
     "fomo_task4": prepare_fomo_task4,
     "fomo_task5": prepare_fomo_task5,
+    "ucsf_bmsr": prepare_ucsf_bmsr,
 }
 
 

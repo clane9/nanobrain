@@ -22,6 +22,8 @@ SYNTHSEG_CORTEX = (3, 42)
 SYNTHSEG_HIPPOCAMPUS = (17, 53)
 TASK4_NERVE = 1
 TASK4_VESSEL = 2
+UCSF_EDEMA = 2
+UCSF_ENHANCING = 3
 AP_EXTENT_MM = 133
 SEGMENTATION_SUBSET_SIZE = 40
 SUBSET_SEED = 0
@@ -198,6 +200,30 @@ def fomo_task5_t1w_cortex() -> Probe:
     return partial(probe_binary_segmentation, dataset=dataset, image_key="t1w", label_key="target")
 
 
+def ucsf_bmsr_label(image_key: str, label_id: int) -> Probe:
+    transform = partial(select_labels, source_key="seg", label_ids=(label_id,))
+    dataset = load_dataset("ucsf_bmsr", [image_key, "mask", "seg"], transform)
+    return partial(
+        probe_binary_segmentation,
+        dataset=dataset,
+        image_key=image_key,
+        label_key="target",
+        max_negative_ratio=MAX_NEGATIVE_RATIO,
+    )
+
+
+def ucsf_bmsr_t1c_enhancing() -> Probe:
+    return ucsf_bmsr_label("t1c", UCSF_ENHANCING)
+
+
+def ucsf_bmsr_t1c_edema() -> Probe:
+    return ucsf_bmsr_label("t1c", UCSF_EDEMA)
+
+
+def ucsf_bmsr_flair_edema() -> Probe:
+    return ucsf_bmsr_label("flair", UCSF_EDEMA)
+
+
 TASKS: dict[str, Callable[[], Probe]] = {
     task.__name__: task
     for task in [
@@ -213,6 +239,9 @@ TASKS: dict[str, Callable[[], Probe]] = {
         fomo_task4_t2w_vessel,
         fomo_task5_t1w_pmg,
         fomo_task5_t1w_cortex,
+        ucsf_bmsr_t1c_enhancing,
+        ucsf_bmsr_t1c_edema,
+        ucsf_bmsr_flair_edema,
     ]
 }
 
@@ -225,6 +254,13 @@ DEFAULT_TASKS = [
     "fomo_task4_t2w_vessel",
     "fomo_task5_t1w_pmg",
     "fomo_task5_t1w_cortex",
+]
+
+# the code is public but the data can't be released, so these run only with --private-evals
+PRIVATE_TASKS = [
+    "ucsf_bmsr_t1c_enhancing",
+    "ucsf_bmsr_t1c_edema",
+    "ucsf_bmsr_flair_edema",
 ]
 
 HEADLINE_METRICS: dict[str, str] = {
@@ -240,4 +276,7 @@ HEADLINE_METRICS: dict[str, str] = {
     "fomo_task4_t2w_vessel": "average_precision",
     "fomo_task5_t1w_pmg": "auroc",
     "fomo_task5_t1w_cortex": "dice",
+    "ucsf_bmsr_t1c_enhancing": "dice",
+    "ucsf_bmsr_t1c_edema": "dice",
+    "ucsf_bmsr_flair_edema": "dice",
 }

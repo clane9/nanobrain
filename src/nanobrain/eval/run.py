@@ -9,7 +9,7 @@ from typing import Any
 import torch
 from torch import nn
 
-from nanobrain.eval.tasks import DEFAULT_TASKS, TASKS
+from nanobrain.eval.tasks import DEFAULT_TASKS, PRIVATE_TASKS, TASKS
 from nanobrain.eval.misc import git_sha
 
 logger = logging.getLogger(__name__)
@@ -40,12 +40,22 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("ckpt_path", type=Path)
     parser.add_argument("output_dir", type=Path)
-    parser.add_argument("--tasks", nargs="+", choices=list(TASKS), default=DEFAULT_TASKS)
+    parser.add_argument("--tasks", nargs="+", choices=list(TASKS))
+    parser.add_argument(
+        "--private-evals",
+        action="store_true",
+        help="allow PRIVATE_TASKS (internal data only), and add them to the default tasks",
+    )
     parser.add_argument("--batch-size", type=int, default=4)
     parser.add_argument("--num-workers", type=int, default=8)
     parser.add_argument("--device", type=str, default="cuda")
     parser.add_argument("--no-amp", action="store_true")
     args = parser.parse_args()
+    if args.tasks is None:
+        args.tasks = DEFAULT_TASKS + (PRIVATE_TASKS if args.private_evals else [])
+    private_tasks = [task for task in args.tasks if task in PRIVATE_TASKS]
+    if private_tasks and not args.private_evals:
+        parser.error(f"{private_tasks} need internal data, pass --private-evals")
 
     logging.basicConfig(level=logging.INFO, format="[%(asctime)s] %(message)s", datefmt="%H:%M:%S")
     args.output_dir.mkdir(parents=True, exist_ok=True)
