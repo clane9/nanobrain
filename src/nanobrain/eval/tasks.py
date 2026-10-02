@@ -256,7 +256,7 @@ DEFAULT_TASKS = [
     "fomo_task5_t1w_cortex",
 ]
 
-# the code is public but the data can't be released, so these run only with --private-evals
+# Restricted data access, run'em with --private-evals
 PRIVATE_TASKS = [
     "ucsf_bmsr_t1c_enhancing",
     "ucsf_bmsr_t1c_edema",

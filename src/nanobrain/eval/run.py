@@ -44,7 +44,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--private-evals",
         action="store_true",
-        help="allow PRIVATE_TASKS (internal data only), and add them to the default tasks",
+        help="allow PRIVATE_TASKS (restricted access), and add them to open tasks",
     )
     parser.add_argument("--batch-size", type=int, default=4)
     parser.add_argument("--num-workers", type=int, default=8)

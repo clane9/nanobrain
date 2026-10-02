@@ -24,7 +24,7 @@ logger = logging.getLogger(__name__)
 
 EVAL_ROOT = Path(os.getenv("NANOBRAIN_EVAL_ROOT", "data/eval"))
 FOMO_RAW_ROOT = Path(os.getenv("FOMO_RAW_ROOT", "data/eval_raw/fomo"))
-UCSF_BMSR_RAW_ROOT = Path(os.getenv("UCSF_BMSR_RAW_ROOT", "data/eval_raw/ucsf_bmsr"))
+PRIVATE_RAW_ROOT = Path(os.getenv("PRIVATE_RAW_ROOT", "data/eval_raw/private"))
 FOMO_URL = "https://sid.erda.dk/share_redirect/fmeuvo1EdF"
 GRID_FOV = (192.0, 240.0, 192.0)
 VMIN_QUANTILE = 0.005
@@ -198,7 +198,7 @@ def prepare_ucsf_bmsr(num_workers: int, device: str) -> hfds.Dataset:
     # one visit per patient, visit 100101A is stored as sub-100101/ses-A
     subjects = sorted(
         f"{session.parent.name.removeprefix('sub-')}{session.name.removeprefix('ses-')}"
-        for session in (UCSF_BMSR_RAW_ROOT / "images").glob("sub-*/ses-*")
+        for session in (PRIVATE_RAW_ROOT / "ucsf-bmsr" / "images").glob("sub-*/ses-*")
     )
     with ProcessPoolExecutor(num_workers) as executor:
         rows = list(tqdm(executor.map(prepare_ucsf_bmsr_subject, subjects), total=len(subjects)))
@@ -216,13 +216,14 @@ def prepare_ucsf_bmsr(num_workers: int, device: str) -> hfds.Dataset:
 
 
 def prepare_ucsf_bmsr_subject(subject: str) -> dict:
+    root = PRIVATE_RAW_ROOT / "ucsf-bmsr"
     sub, ses = f"sub-{subject[:-1]}", f"ses-{subject[-1]}"
     images = {
-        modality: nib.load(UCSF_BMSR_RAW_ROOT / "images" / sub / ses / f"{modality}.nii.gz")
+        modality: nib.load(root / "images" / sub / ses / f"{modality}.nii.gz")
         for modality in ("t1c", "flair")
     }
     # 2 edema (drawn on flair), 3 enhancing tumor
-    segs = {"seg": nib.load(UCSF_BMSR_RAW_ROOT / "labels" / sub / ses / "seg.nii.gz")}
+    segs = {"seg": nib.load(root / "labels" / sub / ses / "seg.nii.gz")}
     encoded = prepare_images(images, segs, reference="t1c")
     return {"subject": subject, **encoded}
 
