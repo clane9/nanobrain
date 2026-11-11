@@ -30,6 +30,7 @@ from nanobrain.data import (
     resample_to_spacing,
 )
 from nanobrain.model import ViTMAE3D, patches_to_volume
+from nanobrain.optim import CombinedOptimizer, Muon, is_muon_param
 from nanobrain.visualization import plot_mask_pred
 
 logger = logging.getLogger()
@@ -356,46 +357,42 @@ def train(
     }
 
 
-def make_optimizer(args: DictConfig, model: nn.Module) -> torch.optim.Optimizer:
+def make_optimizer(args: DictConfig, model: nn.Module):
     # cast or else it corrupts the checkpoint
     betas = tuple(args.betas) if args.betas is not None else None
-
     if args.optimizer == "adamw":
         param_groups = misc.get_param_groups(model)
         misc.update_lr(param_groups, args.lr)
         misc.update_wd(param_groups, args.weight_decay)
         return torch.optim.AdamW(param_groups, betas=betas, fused=args.fused_adamw)
-
     assert args.optimizer == "muon", f"unknown optimizer {args.optimizer}"
-    # the combined optimizer doesn't support the fp16 grad scaler
-    assert args.amp_dtype == "bfloat16", "muon needs bfloat16 amp"
-
-    # muon for the hidden matrices of the encoder and decoder blocks, adamw for the rest
-    # (patch embed, pos embeds, decoder proj and head, norms, biases)
+    # muon for the block matrices, adamw for the rest (embeddings, head, norms, biases)
     muon_names = [
-        name for name, param in model.named_parameters() if param.ndim == 2 and "blocks." in name
+        n
+        for n, p in model.named_parameters()
+        if is_muon_param(
+            n, p, args.muon_encoder_only, args.muon_decoder_only, args.muon_all_matrices
+        )
     ]
     logger.info(f"muon params: {len(muon_names)} matrices")
-    named_params = dict(model.named_parameters())
+    adamw_groups = misc.get_param_groups(model, skip_names=set(muon_names))
+    params = dict(model.named_parameters())
     muon_groups = [
         {
-            "params": [named_params[name] for name in muon_names],
+            "params": [params[n] for n in muon_names],
             "lr_multiplier": args.muon_lr_mult,
             "wd_multiplier": 1.0,
         }
     ]
-    adamw_groups = misc.get_param_groups(model, skip_names=set(muon_names))
-    for param_groups in [muon_groups, adamw_groups]:
-        misc.update_lr(param_groups, args.lr)
-        misc.update_wd(param_groups, args.weight_decay)
-
-    muon = torch.optim.Muon(
-        muon_groups,
-        momentum=args.muon_momentum,
-        adjust_lr_fn=args.muon_adjust_lr_fn,
+    for groups in (adamw_groups, muon_groups):
+        misc.update_lr(groups, args.lr)
+        misc.update_wd(groups, args.weight_decay)
+    return CombinedOptimizer(
+        [
+            torch.optim.AdamW(adamw_groups, betas=betas, fused=args.fused_adamw),
+            Muon(muon_groups, momentum=args.muon_momentum, fused=args.muon_fused),
+        ]
     )
-    adamw = torch.optim.AdamW(adamw_groups, betas=betas, fused=args.fused_adamw)
-    return misc.CombinedOptimizer([muon, adamw])
 
 
 def ignore_sigterm(worker_id: int):
