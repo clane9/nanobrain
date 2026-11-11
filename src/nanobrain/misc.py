@@ -325,6 +325,13 @@ def save_model(args, step, model_without_ddp, optimizer, loss_scaler, wall_time=
         logger.info(f"saving checkpoint {checkpoint_path}")
         save_on_master(to_save, checkpoint_path)
 
+    # the first save past each of checkpoint_minutes
+    for minutes in args.checkpoint_minutes or []:
+        checkpoint_path = output_dir / f"checkpoint-{minutes}min.pth"
+        if wall_time >= minutes * 60 and not checkpoint_path.exists():
+            logger.info(f"saving checkpoint {checkpoint_path}")
+            save_on_master(to_save, checkpoint_path)
+
 
 def load_model(args, model_without_ddp, optimizer, loss_scaler) -> tuple[int, float]:
     """Load args.ckpt, or the last checkpoint when auto resuming. Returns (start step, wall time)."""

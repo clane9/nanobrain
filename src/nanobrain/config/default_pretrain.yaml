@@ -59,11 +59,13 @@ compile: true
 
 # Checkpointing. checkpoint-last.pth is overwritten every checkpoint_period steps and at the end.
 # checkpoint_steps lists steps to also keep as numbered checkpoints.
+# checkpoint_minutes lists times to also keep as eg checkpoint-60min.pth.
 ckpt: null
 resume: false
 auto_resume: true
 checkpoint_period: 2500
 checkpoint_steps: null
+checkpoint_minutes: null
 
 # Logging.
 print_freq: 100

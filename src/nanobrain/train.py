@@ -258,6 +258,7 @@ def train(
     time_limit = args.time_limit * 60 if args.time_limit else float("inf")
     step = start_step
     done = False
+    last_wall_time = prev_wall_time
 
     optimizer.zero_grad()
 
@@ -346,7 +347,12 @@ def train(
                 )
 
         is_save_step = step % args.checkpoint_period == 0 or step in (args.checkpoint_steps or [])
-        if is_save_step or is_last:
+        # crossed one of the checkpoint_minutes since the last step
+        is_minutes_step = any(
+            last_wall_time < minutes * 60 <= wall_time for minutes in args.checkpoint_minutes or []
+        )
+        last_wall_time = wall_time
+        if is_save_step or is_minutes_step or is_last:
             misc.save_model(args, step, model, optimizer, loss_scaler, wall_time)
 
         if is_last:
