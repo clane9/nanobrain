@@ -29,6 +29,7 @@ from nanobrain.data import (
     reorient_to_ras,
     resample_to_spacing,
 )
+from nanobrain.masking import mask_unit_scores
 from nanobrain.model import ViTMAE3D, patches_to_volume
 from nanobrain.visualization import plot_mask_pred
 
@@ -283,6 +284,7 @@ def train(
         batch = batch_transform(batch)
         images = batch["image"]
         masks = batch["mask"]
+        scores = batch["scores"]
 
         with torch.autocast(device_type=device.type, dtype=amp_dtype, enabled=args.amp):
             loss = model(
@@ -292,6 +294,7 @@ def train(
                 num_predict=args.num_predict,
                 num_samples=args.num_samples,
                 with_state=False,
+                scores=scores,
             )
 
         loss_for_log = loss.detach()
@@ -339,7 +342,7 @@ def train(
         # not on stop by signal, just save and exit
         is_plot_step = args.plot_period and (step % args.plot_period == 0 or done)
         if num_examples and is_plot_step:
-            plot_paths = plot_examples(args, model, images, masks, step, amp_dtype, device)
+            plot_paths = plot_examples(args, model, images, masks, scores, step, amp_dtype, device)
             if args.wandb:
                 wandb.log(
                     {f"train/{name}": wandb.Image(str(path)) for name, path in plot_paths.items()},
@@ -394,7 +397,14 @@ def make_batch_transform(args: DictConfig):
         ]
         images = torch.stack([sample["image"] for sample in batch])
         masks = torch.stack([sample["mask"] for sample in batch])
-        return {"image": images, "mask": masks}
+
+        if args.mask_sampler is None or args.mask_sampler == "uniform":
+            scores = None
+        elif args.mask_sampler == "mask_unit":
+            scores = mask_unit_scores(masks, args.num_samples, args.patch_size, args.mask_unit_size)
+        else:
+            raise ValueError(f"unknown mask_sampler {args.mask_sampler}")
+        return {"image": images, "mask": masks, "scores": scores}
 
     return fn
 
@@ -443,6 +453,7 @@ def plot_examples(
     model: nn.Module,
     images: Tensor,
     masks: Tensor,
+    scores: Tensor | None,
     step: int,
     amp_dtype: torch.dtype,
     device: torch.device,
@@ -450,6 +461,8 @@ def plot_examples(
     num_examples = args.plot_nrow * args.plot_ncol
     images = images[:num_examples]
     masks = masks[:num_examples]
+    if scores is not None:
+        scores = scores[:num_examples, :1]
 
     model.eval()
     # eager, the plot shapes differ from training and compiling them isn't worth it
@@ -464,6 +477,7 @@ def plot_examples(
             num_visible=args.num_visible,
             num_predict=args.plot_num_predict,
             num_samples=1,
+            scores=scores,
         )
     model.train()
 

@@ -18,11 +18,17 @@ grid_size: [192, 240, 192]
 target_spacing: 1.0
 patch_size: 8
 
-# Sequence sampling. ~3200 brain mask patches per image on average, so num_visible 640 is a
+# Mask sampling. ~3200 brain mask patches per image on average, so num_visible 640 is a
 # ~0.8 mask ratio.
 num_visible: 640
 num_predict: 1920
 num_samples: 2
+# Samplers:
+#   - uniform: uniform random sampling
+#   - mask_unit: units of mask_unit_size^3 patches (pixio, hiera)
+# null defaults to uniform.
+mask_sampler: null
+mask_unit_size: 2
 
 # Model (ViT-B encoder).
 model_kwargs:

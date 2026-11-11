@@ -172,6 +172,7 @@ class ViTMAE3D(nn.Module):
         num_predict: int | None = None,
         num_samples: int = 1,
         with_state: bool = True,
+        scores: Float[Tensor, "B S N"] | None = None,
     ):
         B = images.shape[0]
         assert tuple(images.shape[1:]) == tuple(self.grid_size)
@@ -181,10 +182,11 @@ class ViTMAE3D(nn.Module):
         coord = self.coord_grid.expand(B, -1, -1)
 
         # sample num_samples sequences per image, then flatten them into the batch
-        # num_predict None predicts all remaining patches (dense decoding)
-        seq_length = None if num_predict is None else num_visible + num_predict
-        order = sample_sequences(mask_patches, num_samples, seq_length)
-        num_predict = order.shape[2] - num_visible
+        visible_ids, predict_ids = sample_sequences(
+            mask_patches, num_visible, num_predict, num_samples, scores
+        )
+        order = torch.cat([visible_ids, predict_ids], dim=2)
+        num_predict = predict_ids.shape[2]
         batch_ids = torch.arange(B, device=images.device)[:, None, None]
         patches = patches[batch_ids, order].flatten(0, 1)
         mask_patches = mask_patches[batch_ids, order].flatten(0, 1)
@@ -345,22 +347,36 @@ def make_coord_grid(
 
 
 def sample_sequences(
-    mask_patches: torch.Tensor,
-    num_samples: int,
-    seq_length: int | None = None,
+    mask_patches: Tensor,
+    num_visible: int,
+    num_predict: int | None,
+    num_samples: int = 1,
+    scores: Tensor | None = None,
     min_mask_frac: float = 0.25,
-) -> torch.Tensor:
+) -> tuple[Tensor, Tensor]:
     batch_size, num_patches, _ = mask_patches.shape
     mask_frac = mask_patches.mean(dim=2)
-    # one independent shuffle per sequence, with patches outside the mask sorted last so
-    # they are only used when a volume has too few mask patches
-    scores = torch.rand(batch_size, num_samples, num_patches, device=mask_patches.device)
-    scores = torch.where(mask_frac[:, None, :] >= min_mask_frac, scores, 2.0)
-    if seq_length is None:
+    in_mask = mask_frac[:, None, :] >= min_mask_frac
+    if num_predict is None:
         # one host sync to get the longest mask sequence in the batch
-        seq_length = (mask_frac >= min_mask_frac).sum(dim=1).max().item()
-    order = scores.argsort(dim=2)[:, :, :seq_length]
-    return order
+        num_predict = (mask_frac >= min_mask_frac).sum(dim=1).max().item() - num_visible
+
+    if scores is None:
+        # one shuffle per sequence, split into visible and predicted
+        keys = torch.rand(batch_size, num_samples, num_patches, device=mask_patches.device)
+        keys = torch.where(in_mask, keys, 2.0)
+        order = keys.argsort(dim=2)[:, :, : num_visible + num_predict]
+        visible_ids, predict_ids = order.split([num_visible, num_predict], dim=2)
+        return visible_ids, predict_ids
+
+    # choose lowest scoring patches as visible, then predict patches uniformly from the rest
+    visible_keys = torch.where(in_mask, scores, torch.inf)
+    visible_ids = visible_keys.topk(num_visible, dim=2, largest=False).indices
+    predict_keys = torch.rand(batch_size, num_samples, num_patches, device=mask_patches.device)
+    predict_keys = torch.where(in_mask, predict_keys, 2.0 + predict_keys)
+    predict_keys = predict_keys.scatter(2, visible_ids, torch.inf)
+    predict_ids = predict_keys.topk(num_predict, dim=2, largest=False).indices
+    return visible_ids, predict_ids
 
 
 # JAX ViT xavier uniform init
