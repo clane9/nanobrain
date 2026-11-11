@@ -53,6 +53,13 @@ betas: [0.9, 0.95]
 clip_grad: 1.0
 fused_adamw: true
 
+# adamw, or muon for the block matrices (torch.optim.Muon) and adamw for the rest.
+# match_rms_adamw scales muon updates to adamw's rms, so they share lr and weight decay.
+optimizer: muon
+muon_lr_mult: 1.0
+muon_momentum: 0.95
+muon_adjust_lr_fn: match_rms_adamw
+
 amp: true
 amp_dtype: bfloat16
 compile: true

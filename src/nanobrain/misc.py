@@ -399,12 +399,12 @@ def clip_grad(optimizer: Optimizer, max_norm: float | None = None) -> Tensor:
 
 
 # from dinov2 with some minor changes
-def get_param_groups(model, patch_embed_lr_mult=1.0):
+def get_param_groups(model, patch_embed_lr_mult=1.0, skip_names: set[str] | None = None):
     # no lr decay, we could add this later if needed
     all_params = []
 
     for name, param in model.named_parameters():
-        if not param.requires_grad:
+        if not param.requires_grad or name in (skip_names or set()):
             continue
         d = {"param": param, "lr_multiplier": 1.0, "wd_multiplier": 1.0, "name": name}
 
@@ -431,6 +431,32 @@ def _fuse_param_groups(all_param_groups):
 
     param_groups = list(fused_param_groups.values())
     return param_groups
+
+
+class CombinedOptimizer:
+    """Steps several optimizers as one. param_groups chains theirs, for lr updates and clipping."""
+
+    def __init__(self, optimizers: list[Optimizer]):
+        self.optimizers = optimizers
+
+    @property
+    def param_groups(self) -> list[dict]:
+        return [group for optimizer in self.optimizers for group in optimizer.param_groups]
+
+    def step(self):
+        for optimizer in self.optimizers:
+            optimizer.step()
+
+    def zero_grad(self, set_to_none: bool = True):
+        for optimizer in self.optimizers:
+            optimizer.zero_grad(set_to_none=set_to_none)
+
+    def state_dict(self) -> dict:
+        return {"optimizers": [optimizer.state_dict() for optimizer in self.optimizers]}
+
+    def load_state_dict(self, state_dict: dict):
+        for optimizer, state in zip(self.optimizers, state_dict["optimizers"], strict=True):
+            optimizer.load_state_dict(state)
 
 
 def update_lr(param_groups, lr: float):

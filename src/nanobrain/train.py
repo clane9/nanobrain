@@ -115,12 +115,7 @@ def main(args: DictConfig):
     else:
         logger.info(f"lr: {args.lr:.2e}")
 
-    param_groups = misc.get_param_groups(model)
-    misc.update_lr(param_groups, args.lr)
-    misc.update_wd(param_groups, args.weight_decay)
-    # cast or else it corrupts the checkpoint
-    betas = tuple(args.betas) if args.betas is not None else None
-    optimizer = torch.optim.AdamW(param_groups, betas=betas, fused=args.fused_adamw)
+    optimizer = make_optimizer(args, model)
 
     lr_schedule = make_lr_schedule(
         args.lr, args.min_lr, args.total_steps, args.warmup_steps, args.decay_steps
@@ -359,6 +354,48 @@ def train(
         "wall_time": prev_wall_time + time.monotonic() - start_time,
         "loss": metric_logger.loss.median,
     }
+
+
+def make_optimizer(args: DictConfig, model: nn.Module) -> torch.optim.Optimizer:
+    # cast or else it corrupts the checkpoint
+    betas = tuple(args.betas) if args.betas is not None else None
+
+    if args.optimizer == "adamw":
+        param_groups = misc.get_param_groups(model)
+        misc.update_lr(param_groups, args.lr)
+        misc.update_wd(param_groups, args.weight_decay)
+        return torch.optim.AdamW(param_groups, betas=betas, fused=args.fused_adamw)
+
+    assert args.optimizer == "muon", f"unknown optimizer {args.optimizer}"
+    # the combined optimizer doesn't support the fp16 grad scaler
+    assert args.amp_dtype == "bfloat16", "muon needs bfloat16 amp"
+
+    # muon for the hidden matrices of the encoder and decoder blocks, adamw for the rest
+    # (patch embed, pos embeds, decoder proj and head, norms, biases)
+    muon_names = [
+        name for name, param in model.named_parameters() if param.ndim == 2 and "blocks." in name
+    ]
+    logger.info(f"muon params: {len(muon_names)} matrices")
+    named_params = dict(model.named_parameters())
+    muon_groups = [
+        {
+            "params": [named_params[name] for name in muon_names],
+            "lr_multiplier": args.muon_lr_mult,
+            "wd_multiplier": 1.0,
+        }
+    ]
+    adamw_groups = misc.get_param_groups(model, skip_names=set(muon_names))
+    for param_groups in [muon_groups, adamw_groups]:
+        misc.update_lr(param_groups, args.lr)
+        misc.update_wd(param_groups, args.weight_decay)
+
+    muon = torch.optim.Muon(
+        muon_groups,
+        momentum=args.muon_momentum,
+        adjust_lr_fn=args.muon_adjust_lr_fn,
+    )
+    adamw = torch.optim.AdamW(adamw_groups, betas=betas, fused=args.fused_adamw)
+    return misc.CombinedOptimizer([muon, adamw])
 
 
 def ignore_sigterm(worker_id: int):
