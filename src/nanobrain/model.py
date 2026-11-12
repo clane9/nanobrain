@@ -38,7 +38,6 @@ class ViTMAE3D(nn.Module):
         class_tokens: int = 1,
         drop_path_rate: float = 0.0,
         clip_quantiles: tuple[float, float] = (0.005, 0.995),
-        norm_target: bool = False,
         min_mask_frac: float = 0.25,
     ):
         super().__init__()
@@ -50,7 +49,6 @@ class ViTMAE3D(nn.Module):
         self.class_tokens = class_tokens
         patch_grid_size = tuple(size // patch_size for size in grid_size)
         self.clip_quantiles = clip_quantiles
-        self.norm_target = norm_target
         self.min_mask_frac = min_mask_frac
 
         patch_dim = patch_size**3
@@ -207,11 +205,6 @@ class ViTMAE3D(nn.Module):
         )
         vis_coord, target_coord = torch.split(coord, [num_visible, num_predict], dim=1)
 
-        # per patch target normalization (MAE norm_pix_loss), stats over in-mask voxels
-        target_stats = None
-        if self.norm_target:
-            target_patches, *target_stats = masked_normalize(target_patches, target_mask_patches)
-
         embeds = self.forward_encoder(vis_patches, vis_coord)
         pred_patches = self.forward_decoder(embeds, target_coord)
         loss = F.mse_loss(pred_patches, target_patches, reduction="none")
@@ -231,7 +224,6 @@ class ViTMAE3D(nn.Module):
             "target_mask_patches": target_mask_patches,
             "embeds": embeds,
             "pred_patches": pred_patches,
-            "target_stats": target_stats,
             "vis_ids": vis_ids,
             "target_ids": target_ids,
             "image_ids": image_ids,
@@ -316,20 +308,6 @@ def patchify3d(x: Tensor, patch_size: int = 8) -> Tensor:
     p = patch_size
     x = rearrange(x, "b (gx px) (gy py) (gz pz) -> b (gx gy gz) (px py pz)", px=p, py=p, pz=p)
     return x
-
-
-def masked_normalize(
-    x: Tensor,
-    mask: Tensor,
-    dim: int | tuple[int, ...] | None = -1,
-    eps: float = 1e-6,
-) -> tuple[Tensor, Tensor, Tensor]:
-    num_obs = mask.sum(dim=dim, keepdim=True).clamp(min=1)
-    mean = (mask * x).sum(dim=dim, keepdim=True) / num_obs
-    var = (mask * (x - mean) ** 2).sum(dim=dim, keepdim=True) / num_obs
-    std = (var + eps) ** 0.5
-    x = mask * (x - mean) / std
-    return x, mean, std
 
 
 def unpatchify3d(x: Tensor, grid_size: tuple[int, int, int], patch_size: int = 8) -> Tensor:
