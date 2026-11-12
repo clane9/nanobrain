@@ -26,15 +26,17 @@ grid_size: [192, 240, 192]
 target_spacing: 1.0
 patch_size: 8
 
-# Encoder tokens per image: a random subset of the in-brain patches, or all of them if null.
-num_tokens: null
+# Encoder tokens per image: a random subset of the in-brain patches (padded if fewer), or all of
+# them if null. Fixed avoids recompiles; ~3200 in-brain patches per image on average at p8.
+num_tokens: 3072
 
 # Share of images with synthetic lesions (the rest are all negative).
 lesion_prob: 0.5
 
 # Loss weights.
 age_weight: 1.0
-lesion_weight: 1.0
+# lesion bce is averaged over all brain voxels, so it needs a larger weight to matter
+lesion_weight: 30.0
 
 # Number of last encoder blocks to train (+ final norm and heads), or null to train everything.
 finetune_blocks: null
@@ -65,7 +67,8 @@ warmup_steps: 200
 decay_steps: 1000
 weight_decay: 0.05
 betas: [0.9, 0.95]
-clip_grad: 1.0
+# no clip, as in mae finetuning
+clip_grad: null
 fused_adamw: true
 
 amp: true
