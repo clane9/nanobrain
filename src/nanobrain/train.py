@@ -485,7 +485,11 @@ def plot_examples(
     patch_size = args.patch_size
     vis_ids = state["vis_ids"]
     target_ids = state["target_ids"]
-    pred = patches_to_volume(state["pred_patches"].float(), target_ids, grid_size, patch_size)
+    pred_patches = state["pred_patches"].float()
+    if state["target_stats"] is not None:
+        target_mean, target_std = state["target_stats"]
+        pred_patches = pred_patches * target_std + target_mean
+    pred = patches_to_volume(pred_patches, target_ids, grid_size, patch_size)
     visible_mask = patches_to_volume(
         torch.ones_like(state["vis_patches"]), vis_ids, grid_size, patch_size
     )

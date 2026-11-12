@@ -40,6 +40,10 @@ model_kwargs:
   decoder_num_heads: 8
   class_tokens: 0
   drop_path_rate: 0.0
+  # normalize each target patch by its in-mask mean and std (MAE norm_pix_loss)
+  norm_target: false
+  # min fraction of in-mask voxels for a patch to be sampled in training
+  min_mask_frac: 0.25
 
 # Optimization. batch_size is images per step; each gives num_samples sequences.
 batch_size: 32
