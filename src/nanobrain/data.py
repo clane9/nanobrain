@@ -13,9 +13,18 @@ from torch.utils.data import Dataset, Sampler
 
 
 class Fomo300kDataset(Dataset):
-    def __init__(self, root: str | Path, filelist: str | Path):
+    def __init__(self, root: str | Path, filelist: str | Path, with_age: bool = False):
         self.root = Path(root)
         self.paths = Path(filelist).read_text().split()
+        self.ages = None
+        if with_age:
+            images = pd.read_parquet(
+                self.root / "tables" / "images.parquet", columns=["path", "age"]
+            )
+            # images.parquet paths are source/<stem>.nii.gz, filelist paths derivatives/<stem>.npz
+            stems = images["path"].str.removeprefix("source/").str.removesuffix(".nii.gz")
+            images.index = "derivatives/" + stems + ".npz"
+            self.ages = images["age"].reindex(self.paths).to_numpy(dtype=np.float32)
         members = pd.read_parquet(
             self.root / "tables" / "shards.parquet", columns=["path", "shard", "offset", "size"]
         )
@@ -41,6 +50,9 @@ class Fomo300kDataset(Dataset):
                 "shape": tuple(npz["shape"].tolist()),
                 "affine": npz["affine"],
             }
+        if self.ages is not None:
+            # nan when unknown
+            sample["age"] = float(self.ages[index])
         return sample
 
 
