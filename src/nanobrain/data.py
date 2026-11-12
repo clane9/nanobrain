@@ -190,3 +190,64 @@ def normalize_values(
     values = values.clamp(low, high)
     values = (values - values.mean()) / values.std(correction=0).clamp_min(1e-6)
     return values
+
+
+def synth_lesion(
+    image: Tensor,
+    mask: Tensor,
+    num_lesions: tuple[int, int] = (1, 1),
+    radius: tuple[float, float] = (5.0, 25.0),
+    roughness: float = 0.5,
+    contrast: tuple[float, float] = (0.8, 2.5),
+    ring_prob: float = 0.0,
+    texture: float = 0.3,
+    edge: float = 0.75,
+    keep_anatomy: tuple[float, float] = (0.0, 0.5),
+) -> tuple[Tensor, Tensor]:
+    # lesions blended into a normalized 1 mm image [X, Y, Z]: a noisy ellipsoid shape, intensity of
+    # the local tissue mean +- contrast (z units), optional rim, smooth texture. label = soft > 0.5
+    device = image.device
+    image = image.clone()
+    label = torch.zeros_like(image)
+    count = int(torch.randint(num_lesions[0], num_lesions[1] + 1, ()))
+    # centers in 4 mm cells whose neighbors are all brain, so ~4-8 mm deep
+    cells = F.avg_pool3d(mask[None, None].float(), kernel_size=4) > 0.99
+    cells = -F.max_pool3d(-cells.float(), kernel_size=3, stride=1, padding=1)[0, 0]
+    centers = torch.multinomial(cells.flatten() + 1e-6, count)
+    centers = torch.stack(torch.unravel_index(centers, cells.shape), dim=1)
+    centers = 4 * centers + torch.randint(0, 4, centers.shape, device=device)
+    # one host sync for all lesion boxes
+    centers = centers.tolist()
+    for center in centers:
+        r = math.exp(math.log(radius[0]) + torch.rand(()).item() * math.log(radius[1] / radius[0]))
+        half = math.ceil(1.6 * r) + 2
+        box = tuple(slice(max(c - half, 0), min(c + half, n)) for c, n in zip(center, image.shape))
+        grids = [torch.arange(b.start, b.stop, device=device) - c for b, c in zip(box, center)]
+        rel = torch.stack(torch.meshgrid(*grids, indexing="ij"), dim=-1).float()
+        axes = r * torch.exp(torch.rand(3, device=device) * 0.6 - 0.3)
+        size = rel.shape[:3]
+        shape_noise = F.interpolate(
+            torch.randn(1, 1, 5, 5, 5, device=device), size=size, mode="trilinear"
+        )[0, 0]
+        dist = (rel / axes).norm(dim=-1) - 1 + roughness * shape_noise
+        soft = torch.sigmoid(-dist * r / edge) * mask[box]
+
+        sign = 1.0 if torch.rand(()) < 0.5 else -1.0
+        amount = sign * (contrast[0] + torch.rand(()).item() * (contrast[1] - contrast[0]))
+        value = torch.full(size, amount, device=device)
+        if torch.rand(()) < ring_prob:
+            rim = 0.2 + 0.3 * torch.rand(()).item()
+            core = torch.sigmoid(-(dist + rim) * r / edge)
+            value = value - core * (amount + 0.5 * amount)
+        tex_size = [max(2, n // 4) for n in size]
+        tex_noise = F.interpolate(
+            torch.randn(1, 1, *tex_size, device=device), size=size, mode="trilinear"
+        )[0, 0]
+        local_mean = (image[box] * mask[box]).sum() / mask[box].sum().clamp_min(1)
+        target = local_mean + value + texture * tex_noise
+        # keep some of the underlying anatomy and noise, so smoothness alone doesn't give it away
+        keep = keep_anatomy[0] + torch.rand(()).item() * (keep_anatomy[1] - keep_anatomy[0])
+        target = target + keep * (image[box] - local_mean)
+        image[box] = (1 - soft) * image[box] + soft * target
+        label[box] = torch.maximum(label[box], (soft > 0.5).float())
+    return image, label

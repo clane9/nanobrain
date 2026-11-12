@@ -9,7 +9,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch import Tensor
-from jaxtyping import Float
+from jaxtyping import Bool, Float
 from timm.layers import DropPath
 
 Layer = Type[nn.Module]
@@ -49,6 +49,7 @@ class Attention(nn.Module):
         self,
         x: Float[Tensor, "B N D"],
         context: Float[Tensor, "B M D"] | None = None,
+        attn_mask: Bool[Tensor, "B 1 1 M"] | None = None,
     ) -> Float[Tensor, "B N D"]:
         if context is None:
             context = x
@@ -59,7 +60,7 @@ class Attention(nn.Module):
         q = self.q(x).reshape(B, N, h, D // h).transpose(1, 2)
         k = self.k(context).reshape(B, M, h, D // h).transpose(1, 2)
         v = self.v(context).reshape(B, M, h, D // h).transpose(1, 2)
-        x = F.scaled_dot_product_attention(q, k, v, is_causal=self.causal)
+        x = F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask, is_causal=self.causal)
         x = x.transpose(1, 2).reshape(B, N, D)
         x = self.proj(x)
         return x
@@ -124,9 +125,10 @@ class Block(nn.Module):
         self,
         x: Float[Tensor, "B N D"],
         context: Float[Tensor, "B M D"] | None = None,
+        attn_mask: Bool[Tensor, "B 1 1 M"] | None = None,
     ) -> Float[Tensor, "B N D"]:
         # should the context also be normalized? capi doesn't, so I guess not
-        x = x + self.drop_path1(self.attn(self.norm1(x), context=context))
+        x = x + self.drop_path1(self.attn(self.norm1(x), context=context, attn_mask=attn_mask))
         x = x + self.drop_path2(self.mlp(self.norm2(x)))
         return x
 

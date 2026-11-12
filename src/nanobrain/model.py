@@ -1,3 +1,5 @@
+import math
+
 import numpy as np
 import torch
 import torch.nn as nn
@@ -6,7 +8,7 @@ from brainmarks_smri.models import EmbeddingOutput, ImageInput, register_model
 from einops import rearrange
 from torch import Tensor
 from torch.nn.attention import SDPBackend, sdpa_kernel
-from jaxtyping import Float, Int
+from jaxtyping import Bool, Float, Int
 
 from .modules import Block, LayerNorm, SeparablePosEmbed3D
 from .data import (
@@ -38,6 +40,7 @@ class ViTMAE3D(nn.Module):
         class_tokens: int = 1,
         drop_path_rate: float = 0.0,
         clip_quantiles: tuple[float, float] = (0.005, 0.995),
+        finetune_heads: bool = False,
     ):
         super().__init__()
         self.grid_size = grid_size
@@ -98,6 +101,12 @@ class ViTMAE3D(nn.Module):
 
         self.decoder_norm = LayerNorm(decoder_embed_dim)
         self.decoder_head = nn.Linear(decoder_embed_dim, patch_dim)
+
+        # supervised finetuning heads on the encoder output (finetune.py). eval doesn't use them
+        self.finetune_heads = finetune_heads
+        if finetune_heads:
+            self.age_head = nn.Linear(embed_dim, 1)
+            self.lesion_head = nn.Linear(embed_dim, patch_dim)
         self.init_weights()
 
     @classmethod
@@ -120,11 +129,15 @@ class ViTMAE3D(nn.Module):
         nn.init.normal_(self.mask_token, std=0.02)
         # initialize the decoder head to zero to prevent hockey stick
         self.decoder_head.weight.data.mul_(0.0)
+        if self.finetune_heads:
+            nn.init.zeros_(self.age_head.weight)
+            nn.init.zeros_(self.lesion_head.weight)
 
     def forward_encoder(
         self,
         patches: Float[Tensor, "B N P"],
         coord: Float[Tensor, "B N 3"],
+        valid: Bool[Tensor, "B N"] | None = None,
     ) -> Float[Tensor, "B R+N D"]:
         B, N, P = patches.shape
         assert coord.shape == (B, N, 3)
@@ -135,8 +148,14 @@ class ViTMAE3D(nn.Module):
         if self.class_tokens:
             x = torch.cat([self.cls_token.expand(B, -1, -1), x], dim=1)
 
+        # padding tokens are masked out as attention keys
+        attn_mask = None
+        if valid is not None:
+            cls_valid = valid.new_ones(B, self.class_tokens)
+            attn_mask = torch.cat([cls_valid, valid], dim=1)[:, None, None, :]
+
         for block in self.blocks:
-            x = block(x)
+            x = block(x, attn_mask=attn_mask)
         x = self.norm(x)
         return x
 
@@ -220,6 +239,56 @@ class ViTMAE3D(nn.Module):
             "image_ids": image_ids,
         }
         return loss, state
+
+    def forward_finetune(
+        self,
+        images: Float[Tensor, "B X Y Z"],
+        mask: Float[Tensor, "B X Y Z"],
+        lesion: Float[Tensor, "B X Y Z"],
+        age: Float[Tensor, " B"],
+        num_tokens: int | None = None,
+    ) -> tuple[Tensor, Tensor]:
+        # age mse on the mean of the in-brain tokens (the eval embedding), lesion bce per voxel.
+        # tokens are the in-brain patches (any mask voxel, as in eval), num_tokens None keeps all.
+        B = images.shape[0]
+        patch_size = self.patch_size[0]
+        patches = patchify3d(images, patch_size)
+        mask_patches = patchify3d(mask, patch_size)
+        lesion_patches = patchify3d(lesion, patch_size)
+        coord = self.coord_grid.expand(B, -1, -1)
+
+        # random order of the in-brain patches, padded with out of brain ones
+        in_mask = mask_patches.any(dim=2)
+        scores = torch.rand(in_mask.shape, device=images.device)
+        scores = torch.where(in_mask, scores, 2.0)
+        if num_tokens is None:
+            # one host sync. round up to limit the number of shapes to compile
+            num_tokens = in_mask.sum(dim=1).max().item()
+            num_tokens = 512 * math.ceil(num_tokens / 512)
+        order = scores.argsort(dim=1)[:, :num_tokens]
+        batch_ids = torch.arange(B, device=images.device)[:, None]
+        patches = patches[batch_ids, order]
+        mask_patches = mask_patches[batch_ids, order]
+        lesion_patches = lesion_patches[batch_ids, order]
+        coord = coord[batch_ids, order]
+        valid = in_mask[batch_ids, order]
+
+        tokens = self.forward_encoder(patches, coord, valid)
+        tokens = tokens[:, self.class_tokens :]
+
+        pooled = (tokens * valid[..., None]).sum(dim=1) / valid.sum(dim=1, keepdim=True)
+        age_pred = self.age_head(pooled)[:, 0].float()
+        age_known = torch.isfinite(age)
+        age_error = (age_pred - age.nan_to_num()).square() * age_known
+        age_loss = age_error.sum() / age_known.sum().clamp_min(1)
+
+        lesion_logits = self.lesion_head(tokens).float()
+        voxel_weight = mask_patches * valid[..., None]
+        lesion_bce = F.binary_cross_entropy_with_logits(
+            lesion_logits, lesion_patches, reduction="none"
+        )
+        lesion_loss = (lesion_bce * voxel_weight).sum() / voxel_weight.sum()
+        return age_loss, lesion_loss
 
     # the methods below implement the brainmarks model contract.
     #   - forward_embeddings: computes a global and dense embedding per input sample

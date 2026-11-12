@@ -1,0 +1,91 @@
+# Supervised finetuning (finetune.py): age head on the mean pooled tokens, lesion head per token on
+# synthetic lesions. Starts from a pretraining checkpoint (init_ckpt), or random weights if null.
+
+# Name of the run. Used for output directory suffix and wandb.
+name: nanobrain-finetune
+
+# Description of the run. Goes in wandb notes.
+notes: null
+
+# Root output directory. The run writes to <output_dir>/<name> when name is set.
+output_dir: output
+
+# Pretraining checkpoint to start from. Loads the model weights only.
+init_ckpt: null
+
+# Data.
+train_filelist: src/nanobrain/config/fomo300k_images.txt
+num_workers: 8
+prefetch_factor: 2
+clip_quantiles: [0.005, 0.995]
+# no age targets from these, they share subjects with eval datasets (as in screen_s2_a0)
+age_exclude_collections: [PT030_OpenNeuro/ds001510]
+
+# Fixed 1mm grid that all images are fit to. Must match init_ckpt.
+grid_size: [192, 240, 192]
+target_spacing: 1.0
+patch_size: 8
+
+# Encoder tokens per image: a random subset of the in-brain patches, or all of them if null.
+num_tokens: null
+
+# Share of images with synthetic lesions (the rest are all negative).
+lesion_prob: 0.5
+
+# Loss weights.
+age_weight: 1.0
+lesion_weight: 1.0
+
+# Number of last encoder blocks to train (+ final norm and heads), or null to train everything.
+finetune_blocks: null
+
+# Model. Must match init_ckpt, plus the finetuning heads.
+model_kwargs:
+  depth: 12
+  embed_dim: 768
+  num_heads: 12
+  decoder_depth: 4
+  decoder_embed_dim: 512
+  decoder_num_heads: 8
+  class_tokens: 0
+  drop_path_rate: 0.0
+  finetune_heads: true
+
+# Optimization. batch_size is images per step.
+batch_size: 32
+accum_iter: 1
+
+base_lr: 1e-3
+lr: null
+min_lr: 1e-6
+# Total wall time limit in minutes.
+time_limit: 10
+total_steps: 2000
+warmup_steps: 200
+decay_steps: 1000
+weight_decay: 0.05
+betas: [0.9, 0.95]
+clip_grad: 1.0
+fused_adamw: true
+
+amp: true
+amp_dtype: bfloat16
+compile: true
+
+# Checkpointing. checkpoint-last.pth is overwritten every checkpoint_period steps and at the end.
+ckpt: null
+resume: false
+auto_resume: true
+checkpoint_period: 100000
+checkpoint_steps: null
+
+# Logging.
+print_freq: 100
+
+device: cuda
+seed: 7338
+debug: false
+
+wandb: false
+wandb_entity: null
+wandb_project: nanobrain
