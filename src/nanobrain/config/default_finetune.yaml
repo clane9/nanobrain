@@ -35,8 +35,7 @@ lesion_prob: 0.5
 
 # Loss weights.
 age_weight: 1.0
-# lesion bce is averaged over all brain voxels, so it needs a larger weight to matter
-lesion_weight: 30.0
+lesion_weight: 1.0
 
 # Number of last encoder blocks to train (+ final norm and heads), or null to train everything.
 finetune_blocks: null
