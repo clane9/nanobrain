@@ -39,6 +39,8 @@ class ViTMAE3D(nn.Module):
         drop_path_rate: float = 0.0,
         clip_quantiles: tuple[float, float] = (0.005, 0.995),
         min_mask_frac: float = 0.25,
+        mean_target: bool = False,
+        mean_input: bool = False,
     ):
         super().__init__()
         self.grid_size = grid_size
@@ -50,6 +52,8 @@ class ViTMAE3D(nn.Module):
         patch_grid_size = tuple(size // patch_size for size in grid_size)
         self.clip_quantiles = clip_quantiles
         self.min_mask_frac = min_mask_frac
+        self.mean_target = mean_target
+        self.mean_input = mean_input
 
         patch_dim = patch_size**3
         self.register_buffer("coord_grid", make_coord_grid(grid_size, patch_size), persistent=False)
@@ -205,6 +209,12 @@ class ViTMAE3D(nn.Module):
         )
         vis_coord, target_coord = torch.split(coord, [num_visible, num_predict], dim=1)
 
+        # replace each input / target patch by its in-mask mean, zero outside the mask
+        if self.mean_input:
+            vis_patches = vis_mask_patches * masked_mean(vis_patches, vis_mask_patches)
+        if self.mean_target:
+            target_patches = target_mask_patches * masked_mean(target_patches, target_mask_patches)
+
         embeds = self.forward_encoder(vis_patches, vis_coord)
         pred_patches = self.forward_decoder(embeds, target_coord)
         loss = F.mse_loss(pred_patches, target_patches, reduction="none")
@@ -270,7 +280,10 @@ class ViTMAE3D(nn.Module):
             }
             sample = self.transform_cuda(sample)
             patches = patchify3d(sample["image"][None], self.patch_size[0])
-            in_mask = (patchify3d(sample["mask"][None], self.patch_size[0]) > 0).any(dim=2)[0]
+            mask_patches = patchify3d(sample["mask"][None].float(), self.patch_size[0])
+            in_mask = (mask_patches > 0).any(dim=2)[0]
+            if self.mean_input:
+                patches = mask_patches * masked_mean(patches, mask_patches)
             # cudnn attention builds a new graph (~45 ms) for each new sequence length
             with (
                 sdpa_kernel([SDPBackend.FLASH_ATTENTION, SDPBackend.EFFICIENT_ATTENTION]),
@@ -308,6 +321,12 @@ def patchify3d(x: Tensor, patch_size: int = 8) -> Tensor:
     p = patch_size
     x = rearrange(x, "b (gx px) (gy py) (gz pz) -> b (gx gy gz) (px py pz)", px=p, py=p, pz=p)
     return x
+
+
+def masked_mean(x: Tensor, mask: Tensor, dim: int | tuple[int, ...] | None = -1) -> Tensor:
+    num_obs = mask.sum(dim=dim, keepdim=True).clamp(min=1)
+    mean = (mask * x).sum(dim=dim, keepdim=True) / num_obs
+    return mean
 
 
 def unpatchify3d(x: Tensor, grid_size: tuple[int, int, int], patch_size: int = 8) -> Tensor:
