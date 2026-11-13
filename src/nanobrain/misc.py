@@ -7,6 +7,7 @@
 # dino: https://github.com/facebookresearch/dino/blob/main/utils.py
 
 import datetime
+import json
 import logging
 import os
 import random
@@ -317,20 +318,22 @@ def save_model(args, step, model_without_ddp, optimizer, loss_scaler, wall_time=
         "git": git_info(),
     }
 
-    logger.info(f"saving checkpoint {last_checkpoint_path}")
-    save_on_master(to_save, last_checkpoint_path)
-
+    checkpoint_paths = [last_checkpoint_path]
     if args.checkpoint_steps and step in args.checkpoint_steps:
-        checkpoint_path = output_dir / f"checkpoint-{step:07d}.pth"
-        logger.info(f"saving checkpoint {checkpoint_path}")
-        save_on_master(to_save, checkpoint_path)
-
+        checkpoint_paths.append(output_dir / f"checkpoint-{step:07d}.pth")
     # the first save past each of checkpoint_minutes
     for minutes in args.checkpoint_minutes or []:
         checkpoint_path = output_dir / f"checkpoint-{minutes}min.pth"
         if wall_time >= minutes * 60 and not checkpoint_path.exists():
-            logger.info(f"saving checkpoint {checkpoint_path}")
-            save_on_master(to_save, checkpoint_path)
+            checkpoint_paths.append(checkpoint_path)
+
+    # step and wall time also go in checkpoint-*.json, kept when checkpoints are deleted
+    checkpoint_info = {"step": step, "wall_time": wall_time, "git": to_save["git"]}
+    for checkpoint_path in checkpoint_paths:
+        logger.info(f"saving checkpoint {checkpoint_path}")
+        save_on_master(to_save, checkpoint_path)
+        if is_main_process():
+            checkpoint_path.with_suffix(".json").write_text(json.dumps(checkpoint_info))
 
 
 def load_model(args, model_without_ddp, optimizer, loss_scaler) -> tuple[int, float]:
