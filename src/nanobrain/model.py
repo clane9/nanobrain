@@ -1,3 +1,5 @@
+from functools import partial
+
 import numpy as np
 import torch
 import torch.nn as nn
@@ -8,7 +10,14 @@ from torch import Tensor
 from torch.nn.attention import SDPBackend, sdpa_kernel
 from jaxtyping import Float, Int
 
-from .modules import Block, LayerNorm, SeparablePosEmbed3D
+from .modules import (
+    Block,
+    AbsolutePosEmbed3D,
+    LayerNorm,
+    Rope3D,
+    SeparablePosEmbed3D,
+    SinCosPosEmbed3D,
+)
 from .data import (
     crop_to_mask,
     fit_to_shape,
@@ -39,6 +48,7 @@ class ViTMAE3D(nn.Module):
         drop_path_rate: float = 0.0,
         clip_quantiles: tuple[float, float] = (0.005, 0.995),
         min_mask_frac: float = 0.25,
+        pos_embed: str = "learned_sep",
     ):
         super().__init__()
         self.grid_size = grid_size
@@ -50,13 +60,30 @@ class ViTMAE3D(nn.Module):
         patch_grid_size = tuple(size // patch_size for size in grid_size)
         self.clip_quantiles = clip_quantiles
         self.min_mask_frac = min_mask_frac
+        self.pos_embed_type = pos_embed
 
         patch_dim = patch_size**3
-        self.register_buffer("coord_grid", make_coord_grid(grid_size, patch_size), persistent=False)
+        # patch center coords in mm, relative to the volume center
+        coord_grid = make_coord_grid(grid_size, patch_size, target_spacing)
+        self.register_buffer("coord_grid", coord_grid, persistent=False)
+        unit = patch_size * target_spacing
 
         # encoder
         self.patch_embed = nn.Linear(patch_dim, embed_dim)
-        self.pos_embed = SeparablePosEmbed3D(patch_grid_size, embed_dim)
+        if pos_embed == "learned_sep":
+            self.pos_embed = SeparablePosEmbed3D(patch_grid_size, embed_dim, unit=unit)
+        elif pos_embed == "learned_full":
+            self.pos_embed = AbsolutePosEmbed3D(patch_grid_size, embed_dim, unit=unit)
+        elif pos_embed == "sincos":
+            self.pos_embed = SinCosPosEmbed3D(patch_grid_size, embed_dim, unit=unit)
+        elif pos_embed in ("none", "rope_axial", "rope_mixed"):
+            self.pos_embed = None
+        else:
+            raise ValueError(f"unknown pos_embed {pos_embed}")
+        if pos_embed in ("rope_axial", "rope_mixed"):
+            pos_embed_layer = partial(Rope3D, learned=pos_embed == "rope_mixed")
+        else:
+            pos_embed_layer = None
         if class_tokens:
             self.cls_token = nn.Parameter(torch.empty(1, class_tokens, embed_dim))
         else:
@@ -74,6 +101,7 @@ class ViTMAE3D(nn.Module):
                     proj_bias=proj_bias,
                     mlp_ratio=mlp_ratio,
                     drop_path=dpr[ii],
+                    pos_embed_layer=pos_embed_layer,
                 )
                 for ii in range(depth)
             ]
@@ -82,7 +110,19 @@ class ViTMAE3D(nn.Module):
 
         # decoder
         self.decoder_proj = nn.Linear(embed_dim, decoder_embed_dim)
-        self.decoder_pos_embed = SeparablePosEmbed3D(patch_grid_size, decoder_embed_dim)
+        # the "none" encoder still needs decoder positions to place the mask tokens
+        if pos_embed in ("learned_sep", "none"):
+            self.decoder_pos_embed = SeparablePosEmbed3D(
+                patch_grid_size, decoder_embed_dim, unit=unit
+            )
+        elif pos_embed == "learned_full":
+            self.decoder_pos_embed = AbsolutePosEmbed3D(
+                patch_grid_size, decoder_embed_dim, unit=unit
+            )
+        elif pos_embed == "sincos":
+            self.decoder_pos_embed = SinCosPosEmbed3D(patch_grid_size, decoder_embed_dim, unit=unit)
+        else:
+            self.decoder_pos_embed = None
         self.mask_token = nn.Parameter(torch.empty(1, 1, decoder_embed_dim))
 
         self.decoder_blocks = nn.ModuleList(
@@ -93,6 +133,7 @@ class ViTMAE3D(nn.Module):
                     qkv_bias=qkv_bias,
                     proj_bias=proj_bias,
                     mlp_ratio=mlp_ratio,
+                    pos_embed_layer=pos_embed_layer,
                 )
                 for ii in range(decoder_depth)
             ]
@@ -113,7 +154,10 @@ class ViTMAE3D(nn.Module):
         )
 
     def extra_repr(self):
-        return f"{self.grid_size}, {self.patch_size}, class_tokens={self.class_tokens}"
+        return (
+            f"{self.grid_size}, {self.patch_size}, class_tokens={self.class_tokens}, "
+            f"pos_embed={self.pos_embed_type}"
+        )
 
     def init_weights(self):
         self.apply(_init_weights)
@@ -132,34 +176,46 @@ class ViTMAE3D(nn.Module):
         assert coord.shape == (B, N, 3)
 
         x = self.patch_embed(patches)
-        x = self.pos_embed(x, coord)
+        if self.pos_embed is not None:
+            x = self.pos_embed(x, coord)
 
         if self.class_tokens:
             x = torch.cat([self.cls_token.expand(B, -1, -1), x], dim=1)
+            # class tokens at the center, i.e. not rotated by rope
+            coord = F.pad(coord, (0, 0, self.class_tokens, 0))
 
         for block in self.blocks:
-            x = block(x)
+            x = block(x, coord=coord)
         x = self.norm(x)
         return x
 
     def forward_decoder(
         self,
         embeds: Float[Tensor, "B R+N D"],
+        coord: Float[Tensor, "B N 3"],
         target_coord: Float[Tensor, "B M 3"],
     ) -> Float[Tensor, "B M P"]:
         B = embeds.shape[0]
+        N = coord.shape[1]
         M = target_coord.shape[1]
         assert target_coord.shape == (B, M, 3)
 
         embeds = self.decoder_proj(embeds)
-
         mask_tokens = self.mask_token.expand(B, M, -1)
-        mask_tokens = self.decoder_pos_embed(mask_tokens, target_coord)
+
+        if self.decoder_pos_embed is not None:
+            mask_tokens = self.decoder_pos_embed(mask_tokens, target_coord)
+        if self.pos_embed_type == "none":
+            prefix, embeds = embeds.split([self.class_tokens, N], dim=1)
+            embeds = torch.cat([prefix, self.decoder_pos_embed(embeds, coord)], dim=1)
 
         x = torch.cat([embeds, mask_tokens], dim=1)
+        coord = torch.cat([coord, target_coord], dim=1)
+        if self.class_tokens:
+            coord = F.pad(coord, (0, 0, self.class_tokens, 0))
 
         for block in self.decoder_blocks:
-            x = block(x)
+            x = block(x, coord=coord)
 
         x = x[:, -M:]
         x = self.decoder_norm(x)
@@ -206,7 +262,7 @@ class ViTMAE3D(nn.Module):
         vis_coord, target_coord = torch.split(coord, [num_visible, num_predict], dim=1)
 
         embeds = self.forward_encoder(vis_patches, vis_coord)
-        pred_patches = self.forward_decoder(embeds, target_coord)
+        pred_patches = self.forward_decoder(embeds, vis_coord, target_coord)
         loss = F.mse_loss(pred_patches, target_patches, reduction="none")
         loss = (target_mask_patches * loss).sum() / target_mask_patches.sum()
 
@@ -344,12 +400,15 @@ def patches_to_volume(
 def make_coord_grid(
     grid_size: tuple[int, int, int],
     patch_size: int = 8,
+    spacing: float = 1.0,
     device: torch.device | None = None,
-) -> Tensor:
+) -> Float[Tensor, "1 N 3"]:
     patch_grid_size = tuple(size // patch_size for size in grid_size)
     grid_ids = [torch.arange(size, device=device) for size in patch_grid_size]
     coords = torch.stack(torch.meshgrid(*grid_ids, indexing="ij"), dim=-1)
     coords = coords.reshape(1, -1, 3)
+    center = (torch.tensor(patch_grid_size, device=device) - 1) / 2
+    coords = (coords - center) * patch_size * spacing
     return coords
 
 
