@@ -49,6 +49,7 @@ class ViTMAE3D(nn.Module):
         clip_quantiles: tuple[float, float] = (0.005, 0.995),
         min_mask_frac: float = 0.25,
         pos_embed: str = "learned_sep",
+        global_pool: str = "avg",
     ):
         super().__init__()
         self.grid_size = grid_size
@@ -61,6 +62,9 @@ class ViTMAE3D(nn.Module):
         self.clip_quantiles = clip_quantiles
         self.min_mask_frac = min_mask_frac
         self.pos_embed_type = pos_embed
+        assert global_pool in ("avg", "cls"), f"unknown global_pool {global_pool}"
+        assert global_pool == "avg" or class_tokens > 0, "cls pooling needs class tokens"
+        self.global_pool = global_pool
 
         patch_dim = patch_size**3
         # patch center coords in mm, relative to the volume center
@@ -156,7 +160,7 @@ class ViTMAE3D(nn.Module):
     def extra_repr(self):
         return (
             f"{self.grid_size}, {self.patch_size}, class_tokens={self.class_tokens}, "
-            f"pos_embed={self.pos_embed_type}"
+            f"pos_embed={self.pos_embed_type}, global_pool={self.global_pool}"
         )
 
     def init_weights(self):
@@ -333,10 +337,16 @@ class ViTMAE3D(nn.Module):
                 torch.autocast(device.type, dtype=torch.bfloat16, enabled=device.type == "cuda"),
             ):
                 tokens = self.forward_encoder(patches[:, in_mask], self.coord_grid[:, in_mask])
+            cls_tokens = tokens[0, : self.class_tokens].float()
             tokens = tokens[0, self.class_tokens :].float()
+            # avg: mean over patch tokens, cls: mean over class tokens
+            if self.global_pool == "cls":
+                global_embedding = cls_tokens.mean(dim=0)
+            else:
+                global_embedding = tokens.mean(dim=0)
 
             output = EmbeddingOutput(
-                global_embedding=tokens.mean(dim=0),
+                global_embedding=global_embedding,
                 dense_embedding=None,
                 dense_affine=None,
                 dense_mask=None,
