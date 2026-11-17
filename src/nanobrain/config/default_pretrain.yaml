@@ -42,9 +42,7 @@ model_kwargs:
   drop_path_rate: 0.0
   # min fraction of in-mask voxels for a patch to be sampled in training
   min_mask_frac: 0.25
-  # learned_sep, learned_full, sincos, none, rope_axial, rope_mixed
   pos_embed: learned_sep
-  # global embedding for eval: avg (patch tokens) or cls (class tokens)
   global_pool: avg
 
 # Optimization. batch_size is images per step; each gives num_samples sequences.

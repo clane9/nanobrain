@@ -80,9 +80,9 @@ class ViTMAE3D(nn.Module):
             self.pos_embed = SeparablePosEmbed3D(patch_grid_size, embed_dim, unit=unit)
         elif pos_embed == "learned_full":
             self.pos_embed = AbsolutePosEmbed3D(patch_grid_size, embed_dim, unit=unit)
-        elif pos_embed == "sincos":
+        elif pos_embed in ("sincos", "rope_sincos"):
             self.pos_embed = SinCosPosEmbed3D(patch_grid_size, embed_dim, unit=unit)
-        elif pos_embed in ("none", "rope_axial", "rope_mixed"):
+        elif pos_embed in ("none", "rope_axial", "rope_mixed", "rope_sincos_dec"):
             self.pos_embed = None
         else:
             raise ValueError(f"unknown pos_embed {pos_embed}")
@@ -91,7 +91,7 @@ class ViTMAE3D(nn.Module):
             self.pool_pos_embed = SinCosPosEmbed3D(patch_grid_size, embed_dim, unit=unit)
         else:
             self.pool_pos_embed = None
-        if pos_embed in ("rope_axial", "rope_mixed"):
+        if pos_embed in ("rope_axial", "rope_mixed", "rope_sincos", "rope_sincos_dec"):
             pos_embed_layer = partial(Rope3D, learned=pos_embed == "rope_mixed")
         else:
             pos_embed_layer = None
@@ -130,7 +130,7 @@ class ViTMAE3D(nn.Module):
             self.decoder_pos_embed = AbsolutePosEmbed3D(
                 patch_grid_size, decoder_embed_dim, unit=unit
             )
-        elif pos_embed == "sincos":
+        elif pos_embed in ("sincos", "rope_sincos", "rope_sincos_dec"):
             self.decoder_pos_embed = SinCosPosEmbed3D(patch_grid_size, decoder_embed_dim, unit=unit)
         else:
             self.decoder_pos_embed = None
@@ -216,7 +216,7 @@ class ViTMAE3D(nn.Module):
 
         if self.decoder_pos_embed is not None:
             mask_tokens = self.decoder_pos_embed(mask_tokens, target_coord)
-        if self.pos_embed_type == "none":
+        if self.pos_embed is None and self.decoder_pos_embed is not None:
             prefix, embeds = embeds.split([self.class_tokens, N], dim=1)
             embeds = torch.cat([prefix, self.decoder_pos_embed(embeds, coord)], dim=1)
 
