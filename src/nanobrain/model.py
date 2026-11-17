@@ -62,8 +62,10 @@ class ViTMAE3D(nn.Module):
         self.clip_quantiles = clip_quantiles
         self.min_mask_frac = min_mask_frac
         self.pos_embed_type = pos_embed
-        assert global_pool in ("avg", "cls"), f"unknown global_pool {global_pool}"
-        assert global_pool == "avg" or class_tokens > 0, "cls pooling needs class tokens"
+        assert global_pool in ("avg", "cls", "avg_plus_pos", "avg_cat_pos", "pos"), (
+            f"unknown global_pool {global_pool}"
+        )
+        assert global_pool != "cls" or class_tokens > 0, "cls pooling needs class tokens"
         self.global_pool = global_pool
 
         patch_dim = patch_size**3
@@ -84,6 +86,11 @@ class ViTMAE3D(nn.Module):
             self.pos_embed = None
         else:
             raise ValueError(f"unknown pos_embed {pos_embed}")
+        # fixed sincos position code for the global embedding (eval only)
+        if global_pool in ("avg_plus_pos", "avg_cat_pos", "pos"):
+            self.pool_pos_embed = SinCosPosEmbed3D(patch_grid_size, embed_dim, unit=unit)
+        else:
+            self.pool_pos_embed = None
         if pos_embed in ("rope_axial", "rope_mixed"):
             pos_embed_layer = partial(Rope3D, learned=pos_embed == "rope_mixed")
         else:
@@ -339,9 +346,22 @@ class ViTMAE3D(nn.Module):
                 tokens = self.forward_encoder(patches[:, in_mask], self.coord_grid[:, in_mask])
             cls_tokens = tokens[0, : self.class_tokens].float()
             tokens = tokens[0, self.class_tokens :].float()
-            # avg: mean over patch tokens, cls: mean over class tokens
+            if self.pool_pos_embed is not None:
+                pos = self.pool_pos_embed(
+                    torch.zeros_like(tokens[None]), self.coord_grid[:, in_mask]
+                )
+                pos = pos[0]
+
+            # avg: mean over patch tokens, cls: mean over class tokens. The pos variants add or
+            # concatenate a fixed sincos code of each token's position, or use it alone.
             if self.global_pool == "cls":
                 global_embedding = cls_tokens.mean(dim=0)
+            elif self.global_pool == "avg_plus_pos":
+                global_embedding = (tokens + pos).mean(dim=0)
+            elif self.global_pool == "avg_cat_pos":
+                global_embedding = torch.cat([tokens.mean(dim=0), pos.mean(dim=0)])
+            elif self.global_pool == "pos":
+                global_embedding = pos.mean(dim=0)
             else:
                 global_embedding = tokens.mean(dim=0)
 
@@ -362,9 +382,12 @@ class ViTMAE3D(nn.Module):
 
 
 @register_model
-def vit_mae_3d(checkpoint: str, random_weights: bool = False) -> ViTMAE3D:
+def vit_mae_3d(checkpoint: str, random_weights: bool = False, **kwargs) -> ViTMAE3D:
     ckpt = torch.load(checkpoint, map_location="cpu", weights_only=True)
-    model = ViTMAE3D.from_config(ckpt["args"])
+    args = ckpt["args"]
+    # override the checkpoint's model_kwargs, e.g. global_pool to evaluate another pooling
+    args["model_kwargs"].update(kwargs)
+    model = ViTMAE3D.from_config(args)
     if not random_weights:
         model.load_state_dict(ckpt["model"])
     return model
