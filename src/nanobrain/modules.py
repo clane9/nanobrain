@@ -3,7 +3,6 @@
 # timm: https://github.com/huggingface/pytorch-image-models/blob/v1.0.20/timm/models/vision_transformer.py
 # vjepa2: https://github.com/facebookresearch/vjepa2/blob/main/src/models/utils/pos_embs.py
 
-import math
 from functools import partial
 from typing import Type
 
@@ -197,40 +196,6 @@ class SeparablePosEmbed3D(nn.Module):
         return f"{self.embed_dim}, {self.grid_size}, unit={self.unit}"
 
 
-class AbsolutePosEmbed3D(nn.Module):
-    def __init__(
-        self,
-        grid_size: tuple[int, int, int],
-        embed_dim: int,
-        unit: float = 1.0,
-    ) -> None:
-        super().__init__()
-        self.embed_dim = embed_dim
-        self.grid_size = grid_size
-        self.unit = unit
-        self.weight = nn.Parameter(torch.empty(math.prod(grid_size), embed_dim))
-        self.reset_parameters()
-
-    def reset_parameters(self):
-        nn.init.trunc_normal_(self.weight, std=0.02)
-
-    def forward(
-        self,
-        x: Float[Tensor, "B N D"],
-        coord: Float[Tensor, "B N 3"],
-    ) -> Float[Tensor, "B N D"]:
-        X, Y, Z = self.grid_size
-        x_ids = torch.round(coord[:, :, 0] / self.unit + (X - 1) / 2).to(torch.int64)
-        y_ids = torch.round(coord[:, :, 1] / self.unit + (Y - 1) / 2).to(torch.int64)
-        z_ids = torch.round(coord[:, :, 2] / self.unit + (Z - 1) / 2).to(torch.int64)
-        pos_ids = (x_ids * Y + y_ids) * Z + z_ids
-        x = x + self.weight[pos_ids]
-        return x
-
-    def extra_repr(self):
-        return f"{self.embed_dim}, {self.grid_size}, unit={self.unit}"
-
-
 class SinCosPosEmbed3D(nn.Module):
     def __init__(
         self,
@@ -338,19 +303,14 @@ class Rope3D(nn.Module):
         dim: int,
         max_freq: float = 1 / 16,
         min_freq: float = 1 / 160_000,
-        learned: bool = False,
     ):
         super().__init__()
         self.dim = dim
         self.max_freq = max_freq
         self.min_freq = min_freq
-        self.learned = learned
 
         freqs = get_3d_rope_freqs(dim, max_freq, min_freq)
-        if learned:
-            self.freqs = nn.Parameter(freqs)
-        else:
-            self.register_buffer("freqs", freqs, persistent=False)
+        self.register_buffer("freqs", freqs, persistent=False)
 
     def forward(
         self, x: Float[Tensor, "*b d"], coord: Float[Tensor, "*b 3"]
@@ -362,7 +322,7 @@ class Rope3D(nn.Module):
         return out.to(x.dtype)
 
     def extra_repr(self):
-        return f"{self.dim}, max_freq={self.max_freq}, min_freq={self.min_freq}, learned={self.learned}"
+        return f"{self.dim}, max_freq={self.max_freq}, min_freq={self.min_freq}"
 
 
 def get_3d_rope_freqs(dim: int, max_freq: float, min_freq: float) -> Float[Tensor, "3 D/2"]:

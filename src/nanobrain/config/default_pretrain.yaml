@@ -42,8 +42,8 @@ model_kwargs:
   drop_path_rate: 0.0
   # min fraction of in-mask voxels for a patch to be sampled in training
   min_mask_frac: 0.25
+  # learned_sep, sincos, rope_axial
   pos_embed: learned_sep
-  global_pool: avg
 
 # Optimization. batch_size is images per step; each gives num_samples sequences.
 batch_size: 32

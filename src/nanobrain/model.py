@@ -1,5 +1,3 @@
-from functools import partial
-
 import numpy as np
 import torch
 import torch.nn as nn
@@ -12,7 +10,6 @@ from jaxtyping import Float, Int
 
 from .modules import (
     Block,
-    AbsolutePosEmbed3D,
     LayerNorm,
     Rope3D,
     SeparablePosEmbed3D,
@@ -49,7 +46,6 @@ class ViTMAE3D(nn.Module):
         clip_quantiles: tuple[float, float] = (0.005, 0.995),
         min_mask_frac: float = 0.25,
         pos_embed: str = "learned_sep",
-        global_pool: str = "avg",
     ):
         super().__init__()
         self.grid_size = grid_size
@@ -62,11 +58,6 @@ class ViTMAE3D(nn.Module):
         self.clip_quantiles = clip_quantiles
         self.min_mask_frac = min_mask_frac
         self.pos_embed_type = pos_embed
-        assert global_pool in ("avg", "cls", "avg_plus_pos", "avg_cat_pos", "pos"), (
-            f"unknown global_pool {global_pool}"
-        )
-        assert global_pool != "cls" or class_tokens > 0, "cls pooling needs class tokens"
-        self.global_pool = global_pool
 
         patch_dim = patch_size**3
         # patch center coords in mm, relative to the volume center
@@ -78,35 +69,13 @@ class ViTMAE3D(nn.Module):
         self.patch_embed = nn.Linear(patch_dim, embed_dim)
         if pos_embed == "learned_sep":
             self.pos_embed = SeparablePosEmbed3D(patch_grid_size, embed_dim, unit=unit)
-        elif pos_embed == "learned_full":
-            self.pos_embed = AbsolutePosEmbed3D(patch_grid_size, embed_dim, unit=unit)
-        elif pos_embed in ("sincos", "rope_sincos"):
+        elif pos_embed == "sincos":
             self.pos_embed = SinCosPosEmbed3D(patch_grid_size, embed_dim, unit=unit)
-        elif pos_embed in (
-            "none",
-            "rope_axial",
-            "rope_mixed",
-            "rope_sincos_dec",
-            "rope_sincos_mask",
-        ):
+        elif pos_embed == "rope_axial":
             self.pos_embed = None
         else:
             raise ValueError(f"unknown pos_embed {pos_embed}")
-        # fixed sincos position code for the global embedding (eval only)
-        if global_pool in ("avg_plus_pos", "avg_cat_pos", "pos"):
-            self.pool_pos_embed = SinCosPosEmbed3D(patch_grid_size, embed_dim, unit=unit)
-        else:
-            self.pool_pos_embed = None
-        if pos_embed in (
-            "rope_axial",
-            "rope_mixed",
-            "rope_sincos",
-            "rope_sincos_dec",
-            "rope_sincos_mask",
-        ):
-            pos_embed_layer = partial(Rope3D, learned=pos_embed == "rope_mixed")
-        else:
-            pos_embed_layer = None
+        pos_embed_layer = Rope3D if pos_embed == "rope_axial" else None
         if class_tokens:
             self.cls_token = nn.Parameter(torch.empty(1, class_tokens, embed_dim))
         else:
@@ -133,16 +102,11 @@ class ViTMAE3D(nn.Module):
 
         # decoder
         self.decoder_proj = nn.Linear(embed_dim, decoder_embed_dim)
-        # the "none" encoder still needs decoder positions to place the mask tokens
-        if pos_embed in ("learned_sep", "none"):
+        if pos_embed == "learned_sep":
             self.decoder_pos_embed = SeparablePosEmbed3D(
                 patch_grid_size, decoder_embed_dim, unit=unit
             )
-        elif pos_embed == "learned_full":
-            self.decoder_pos_embed = AbsolutePosEmbed3D(
-                patch_grid_size, decoder_embed_dim, unit=unit
-            )
-        elif pos_embed in ("sincos", "rope_sincos", "rope_sincos_dec", "rope_sincos_mask"):
+        elif pos_embed == "sincos":
             self.decoder_pos_embed = SinCosPosEmbed3D(patch_grid_size, decoder_embed_dim, unit=unit)
         else:
             self.decoder_pos_embed = None
@@ -179,7 +143,7 @@ class ViTMAE3D(nn.Module):
     def extra_repr(self):
         return (
             f"{self.grid_size}, {self.patch_size}, class_tokens={self.class_tokens}, "
-            f"pos_embed={self.pos_embed_type}, global_pool={self.global_pool}"
+            f"pos_embed={self.pos_embed_type}"
         )
 
     def init_weights(self):
@@ -219,7 +183,6 @@ class ViTMAE3D(nn.Module):
         target_coord: Float[Tensor, "B M 3"],
     ) -> Float[Tensor, "B M P"]:
         B = embeds.shape[0]
-        N = coord.shape[1]
         M = target_coord.shape[1]
         assert target_coord.shape == (B, M, 3)
 
@@ -228,9 +191,6 @@ class ViTMAE3D(nn.Module):
 
         if self.decoder_pos_embed is not None:
             mask_tokens = self.decoder_pos_embed(mask_tokens, target_coord)
-        if self.pos_embed_type in ("none", "rope_sincos_dec"):
-            prefix, embeds = embeds.split([self.class_tokens, N], dim=1)
-            embeds = torch.cat([prefix, self.decoder_pos_embed(embeds, coord)], dim=1)
 
         x = torch.cat([embeds, mask_tokens], dim=1)
         coord = torch.cat([coord, target_coord], dim=1)
@@ -356,29 +316,10 @@ class ViTMAE3D(nn.Module):
                 torch.autocast(device.type, dtype=torch.bfloat16, enabled=device.type == "cuda"),
             ):
                 tokens = self.forward_encoder(patches[:, in_mask], self.coord_grid[:, in_mask])
-            cls_tokens = tokens[0, : self.class_tokens].float()
             tokens = tokens[0, self.class_tokens :].float()
-            if self.pool_pos_embed is not None:
-                pos = self.pool_pos_embed(
-                    torch.zeros_like(tokens[None]), self.coord_grid[:, in_mask]
-                )
-                pos = pos[0]
-
-            # avg: mean over patch tokens, cls: mean over class tokens. The pos variants add or
-            # concatenate a fixed sincos code of each token's position, or use it alone.
-            if self.global_pool == "cls":
-                global_embedding = cls_tokens.mean(dim=0)
-            elif self.global_pool == "avg_plus_pos":
-                global_embedding = (tokens + pos).mean(dim=0)
-            elif self.global_pool == "avg_cat_pos":
-                global_embedding = torch.cat([tokens.mean(dim=0), pos.mean(dim=0)])
-            elif self.global_pool == "pos":
-                global_embedding = pos.mean(dim=0)
-            else:
-                global_embedding = tokens.mean(dim=0)
 
             output = EmbeddingOutput(
-                global_embedding=global_embedding,
+                global_embedding=tokens.mean(dim=0),
                 dense_embedding=None,
                 dense_affine=None,
                 dense_mask=None,
@@ -397,7 +338,7 @@ class ViTMAE3D(nn.Module):
 def vit_mae_3d(checkpoint: str, random_weights: bool = False, **kwargs) -> ViTMAE3D:
     ckpt = torch.load(checkpoint, map_location="cpu", weights_only=True)
     args = ckpt["args"]
-    # override the checkpoint's model_kwargs, e.g. global_pool to evaluate another pooling
+    # override the checkpoint's model_kwargs
     args["model_kwargs"].update(kwargs)
     model = ViTMAE3D.from_config(args)
     if not random_weights:
