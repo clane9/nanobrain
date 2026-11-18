@@ -11,7 +11,7 @@ from torch import Tensor
 from torch.nn.init import trunc_normal_
 
 
-class PrototypeHead(nn.Module):
+class DINOHead(nn.Module):
     """dinov2 DINOHead: mlp to a bottleneck, l2 norm, then l2-normed prototypes.
 
     dinov2 uses weight_norm with weight_g filled with 1 (DINO also freezes it); here the
@@ -47,7 +47,7 @@ class PrototypeHead(nn.Module):
         return F.linear(x, weight)
 
 
-class PrototypeCELoss(nn.Module):
+class DINOLoss(nn.Module):
     """dinov2 iBOTPatchLoss on one gpu: teacher centering or sinkhorn, and per-token cross entropy.
 
     The center update is applied right away, so the teacher probs of a batch use the center

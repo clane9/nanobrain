@@ -31,8 +31,8 @@ from nanobrain.data import (
     reorient_to_ras,
     resample_to_spacing,
 )
-from nanobrain.masking import make_view_sampler
-from nanobrain.model import build_model, patchify3d, select_tokens
+from nanobrain.masking import MaskUnitViews, RandomViews
+from nanobrain.model import DINO3D, JEPA3D, patchify3d, select_tokens
 from nanobrain.visualization import plot_feature_pca
 
 logger = logging.getLogger()
@@ -41,6 +41,8 @@ ROOT = Path(__file__).parents[2]
 # brainmarks-smri data folder, shared with the eval
 DATA_ROOT = Path(os.environ["BRAINMARKS_SMRI_DATA"])
 DEFAULT_CONFIG = Path(__file__).parent / "config/default_pretrain.yaml"
+
+MODELS = {"jepa": JEPA3D, "dino": DINO3D}
 
 
 def main(args: DictConfig):
@@ -91,7 +93,7 @@ def main(args: DictConfig):
     misc.snapshot_source(ROOT / "src", output_dir / "source.tar.gz")
 
     # model
-    model = build_model(args)
+    model = MODELS[args.model].from_config(OmegaConf.to_container(args))
     model.to(device)
     logger.info(f"model:\n{model}")
     # trained params only (student encoder, predictor, head), the teacher is an EMA copy
@@ -396,6 +398,23 @@ def make_lr_schedule(
     stable = np.full(total_steps - warmup_steps - decay_steps, lr)
     decay = np.linspace(lr, min_lr, decay_steps)
     return np.concatenate([warmup, stable, decay])
+
+
+def make_view_sampler(config: DictConfig, patch_grid_size: tuple[int, int, int]) -> nn.Module:
+    if config.name == "random":
+        return RandomViews(
+            config.num_student, config.num_teacher, config.num_overlap, config.min_mask_frac
+        )
+    if config.name == "mask_unit":
+        return MaskUnitViews(
+            config.num_student,
+            config.num_teacher,
+            config.num_overlap,
+            patch_grid_size,
+            unit_size=config.unit_size,
+            min_mask_frac=config.min_mask_frac,
+        )
+    raise ValueError(f"unknown view sampler {config.name}")
 
 
 def make_batch_transform(

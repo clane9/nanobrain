@@ -1,4 +1,5 @@
 import copy
+import inspect
 
 import numpy as np
 import torch
@@ -17,7 +18,7 @@ from .data import (
     reorient_to_ras,
     resample_to_spacing,
 )
-from .losses import PrototypeCELoss, PrototypeHead, entropy_regularizer
+from .losses import DINOHead, DINOLoss, entropy_regularizer
 from .modules import (
     Block,
     LayerNorm,
@@ -318,6 +319,16 @@ class JEPA3D(nn.Module):
         )
         self.teacher_encoder = copy.deepcopy(self.encoder).requires_grad_(False)
 
+    @classmethod
+    def from_config(cls, args: dict) -> "JEPA3D":
+        kwargs = filter_kwargs(cls, args["model_kwargs"])
+        return cls(
+            grid_size=tuple(args["grid_size"]),
+            target_spacing=args["target_spacing"],
+            patch_size=args["patch_size"],
+            **kwargs,
+        )
+
     def train(self, mode: bool = True):
         # the teacher always runs in eval mode, e.g. no drop path (as capi)
         super().train(mode)
@@ -364,8 +375,9 @@ class JEPA3D(nn.Module):
         return loss, state
 
 
-class PrototypeCE3D(nn.Module):
-    """iBOT / DINOv2 / JEM: cross entropy from teacher to student prototype distributions.
+class DINO3D(nn.Module):
+    """DINO / iBOT / DINOv2 / JEM: cross entropy from teacher to student
+    prototype distributions, on patch tokens.
 
     teacher_balance: softmax (JEM, no balancing), center (DINO / iBOT), sinkhorn (DINOv2).
     entropy_weight: JEM's R_global on the student distributions, 0 disables.
@@ -409,10 +421,21 @@ class PrototypeCE3D(nn.Module):
             pos_embed=self.encoder.pos_embed_type,
             **(predictor_kwargs or {}),
         )
-        self.head = PrototypeHead(embed_dim, **(head_kwargs or {}))
-        self.loss = PrototypeCELoss(self.head.num_prototypes, student_temp, center_momentum)
+        head_kwargs = filter_kwargs(DINOHead, (head_kwargs or {}))
+        self.head = DINOHead(embed_dim, **head_kwargs)
+        self.loss = DINOLoss(self.head.num_prototypes, student_temp, center_momentum)
         self.teacher_encoder = copy.deepcopy(self.encoder).requires_grad_(False)
         self.teacher_head = copy.deepcopy(self.head).requires_grad_(False)
+
+    @classmethod
+    def from_config(cls, args: dict) -> "DINO3D":
+        kwargs = filter_kwargs(cls, args["model_kwargs"])
+        return cls(
+            grid_size=tuple(args["grid_size"]),
+            target_spacing=args["target_spacing"],
+            patch_size=args["patch_size"],
+            **kwargs,
+        )
 
     def train(self, mode: bool = True):
         # the teacher always runs in eval mode, e.g. no drop path (as capi)
@@ -480,19 +503,6 @@ class PrototypeCE3D(nn.Module):
             loss = loss + self.entropy_weight * entropy_loss
             state["entropy_loss"] = entropy_loss.detach()
         return loss, state
-
-
-MODELS = {"jepa": JEPA3D, "prototype_ce": PrototypeCE3D}
-
-
-def build_model(args: dict) -> nn.Module:
-    model_class = MODELS[args["model"]]
-    return model_class(
-        grid_size=tuple(args["grid_size"]),
-        target_spacing=args["target_spacing"],
-        patch_size=args["patch_size"],
-        **args["model_kwargs"],
-    )
 
 
 @register_model
@@ -564,3 +574,9 @@ def _init_weights(m: nn.Module) -> None:
         nn.init.constant_(m.weight, 1.0)
         if m.bias is not None:
             nn.init.constant_(m.bias, 0)
+
+
+def filter_kwargs(func, kwargs):
+    signature = inspect.signature(func)
+    kwargs = {k: v for k, v in kwargs.items() if k in signature.parameters}
+    return kwargs

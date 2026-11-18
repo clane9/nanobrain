@@ -101,13 +101,3 @@ class MaskUnitViews(nn.Module):
             f"num_overlap={self.num_overlap}, unit_size={self.unit_size}, "
             f"min_mask_frac={self.min_mask_frac}"
         )
-
-
-def make_view_sampler(config: dict, patch_grid_size: tuple[int, int, int]) -> nn.Module:
-    kwargs = dict(config)
-    name = kwargs.pop("name")
-    if name == "random":
-        return RandomViews(**kwargs)
-    if name == "mask_unit":
-        return MaskUnitViews(**kwargs, patch_grid_size=patch_grid_size)
-    raise ValueError(f"unknown view sampler {name}")

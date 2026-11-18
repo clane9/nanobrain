@@ -182,11 +182,7 @@ def normalize_values(
     return values
 
 
-# Photometric augmentation of z-scored images on the training grid, as torch modules (composed
-# with torchvision's Compose and RandomApply) over the functions below. Each module takes and
-# returns a sample dict with "image" and "mask". Outside the mask stays zero. Random parameters are
-# drawn on the cpu, so no device syncs. torchvision's intensity transforms
-# assume [0, 1] images and don't keep the mask, so these are our own.
+# Data augmentations on preprocessed (z-scored) images.
 
 
 def adjust_gamma(
@@ -236,18 +232,22 @@ def add_noise(image: Float[Tensor, "X Y Z"], mask: Tensor, std: float) -> Float[
     return (image + std * torch.randn_like(image)) * (mask > 0)
 
 
+# Augmentation modules. strength sets the range of each: log gamma ~ U(-s, s), log bias field std
+# s, log scale and shift ~ U(-s, s), noise std ~ U(0, s).
+
+
 class RandomGamma(nn.Module):
-    def __init__(self, max_log_gamma: float = 0.3):
+    def __init__(self, strength: float = 0.3):
         super().__init__()
-        self.max_log_gamma = max_log_gamma
+        self.strength = strength
 
     def forward(self, sample: dict) -> dict:
-        log_gamma = torch.empty(()).uniform_(-self.max_log_gamma, self.max_log_gamma).item()
+        log_gamma = torch.empty(()).uniform_(-self.strength, self.strength).item()
         image = adjust_gamma(sample["image"], sample["mask"], math.exp(log_gamma))
         return {**sample, "image": image}
 
     def extra_repr(self):
-        return f"max_log_gamma={self.max_log_gamma}"
+        return f"strength={self.strength}"
 
 
 class RandomBiasField(nn.Module):
@@ -269,33 +269,32 @@ class RandomBiasField(nn.Module):
 
 
 class RandomScaleShift(nn.Module):
-    def __init__(self, max_log_scale: float = 0.2, max_shift: float = 0.2):
+    def __init__(self, strength: float = 0.2):
         super().__init__()
-        self.max_log_scale = max_log_scale
-        self.max_shift = max_shift
+        self.strength = strength
 
     def forward(self, sample: dict) -> dict:
-        log_scale = torch.empty(()).uniform_(-self.max_log_scale, self.max_log_scale).item()
-        shift = torch.empty(()).uniform_(-self.max_shift, self.max_shift).item()
+        log_scale = torch.empty(()).uniform_(-self.strength, self.strength).item()
+        shift = torch.empty(()).uniform_(-self.strength, self.strength).item()
         image = scale_shift(sample["image"], sample["mask"], math.exp(log_scale), shift)
         return {**sample, "image": image}
 
     def extra_repr(self):
-        return f"max_log_scale={self.max_log_scale}, max_shift={self.max_shift}"
+        return f"strength={self.strength}"
 
 
 class RandomNoise(nn.Module):
-    def __init__(self, max_std: float = 0.1):
+    def __init__(self, strength: float = 0.1):
         super().__init__()
-        self.max_std = max_std
+        self.strength = strength
 
     def forward(self, sample: dict) -> dict:
-        std = torch.empty(()).uniform_(0, self.max_std).item()
+        std = torch.empty(()).uniform_(0, self.strength).item()
         image = add_noise(sample["image"], sample["mask"], std)
         return {**sample, "image": image}
 
     def extra_repr(self):
-        return f"max_std={self.max_std}"
+        return f"strength={self.strength}"
 
 
 AUGMENTATIONS = {
@@ -306,14 +305,14 @@ AUGMENTATIONS = {
 }
 
 
-def make_augment(config: list[dict] | None) -> nn.Module:
-    """Compose from a list of {name, p, **kwargs}, e.g. [{name: gamma, p: 0.5, max_log_gamma: 0.3}]."""
+def make_augment(config: dict | None) -> nn.Module:
+    """Compose from {name: {p, strength}}, in config order. p = 0 skips an augmentation."""
     transforms = []
-    for entry in config or []:
-        kwargs = dict(entry)
-        name = kwargs.pop("name")
-        p = kwargs.pop("p", 1.0)
-        transform = AUGMENTATIONS[name](**kwargs)
+    for name, entry in (config or {}).items():
+        p = entry["p"]
+        if p == 0:
+            continue
+        transform = AUGMENTATIONS[name](strength=entry["strength"])
         if p < 1.0:
             transform = v2.RandomApply([transform], p=p)
         transforms.append(transform)

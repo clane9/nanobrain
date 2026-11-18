@@ -17,31 +17,38 @@ grid_size: [192, 240, 192]
 target_spacing: 1.0
 patch_size: 8
 
-# Views. ~3200 brain mask patches per image on average. The student encodes num_student
-# tokens, the EMA teacher num_teacher, num_overlap of them shared. The loss covers every teacher
-# token, seen by the student or not. Samplers: random, mask_unit (adds unit_size).
+# Views. ~3200 brain mask patches per image on average.
 views:
+  # samplers: random, mask_unit
   name: random
   num_student: 512
   num_teacher: 1536
   num_overlap: 256
   # min fraction of in-mask voxels for a patch to be sampled
   min_mask_frac: 0.25
+  # for mask_unit sampling
+  unit_size: 2
 num_samples: 2
 # loss weight of teacher positions the student also sees (unseen positions weigh 1)
 seen_weight: 1.0
 
-# Photometric augmentation per view, a list of {name, p, **kwargs}. Names: gamma
-# (max_log_gamma), bias_field (strength, num_freqs), scale_shift (max_log_scale, max_shift),
-# noise (max_std). Empty list disables. e.g.
-#   - {name: bias_field, p: 0.5, strength: 0.2}
-student_augment: []
-teacher_augment: []
+# Augmentation per view, in this order. p is the probability of applying each (0 skips it),
+# strength its range: log gamma ~ U(-s, s), log bias field std s, log scale and shift ~ U(-s, s),
+# noise std ~ U(0, s), all in z units.
+student_augment:
+  gamma: {p: 0.5, strength: 0.5}
+  bias_field: {p: 0.5, strength: 0.3}
+  scale_shift: {p: 0.0, strength: 0.2}
+  noise: {p: 0.5, strength: 0.1}
+teacher_augment:
+  gamma: {p: 0.0, strength: 0.5}
+  bias_field: {p: 0.0, strength: 0.3}
+  scale_shift: {p: 0.0, strength: 0.2}
+  noise: {p: 0.0, strength: 0.1}
 
-# Model: jepa (smooth l1 to layer-normed teacher tokens, I-JEPA) or prototype_ce (prototype
-# cross entropy, iBOT / DINOv2 / JEM). prototype_ce also takes head_kwargs (num_prototypes,
-# num_layers, hidden_dim, bottleneck_dim), student_temp, teacher_temp, teacher_balance
-# (softmax, center, sinkhorn), center_momentum, entropy_weight.
+# Model:
+# - jepa (smooth l1 loss, i.e. I-JEPA)
+# - dino (self-distillation, i.e. DINO, iBOT, DINOv2, JEM)
 model: jepa
 model_kwargs:
   # ViT-B
@@ -52,13 +59,26 @@ model_kwargs:
     class_tokens: 0
     drop_path_rate: 0.0
     # learned_sep, sincos, rope_axial
-    pos_embed: learned_sep
+    pos_embed: rope_axial
   predictor_kwargs:
     depth: 4
     predictor_dim: 512
     num_heads: 8
     # self_attn (MAE / I-JEPA) or cross_attn (CAPI)
     attn_type: self_attn
+  head_kwargs:
+    num_prototypes: 4096
+    num_layers: 3
+    hidden_dim: 2048
+    bottleneck_dim: 256
+  # extra dino kwargs
+  student_temp: 0.1
+  teacher_temp: 0.05
+  # teacher anti-collapse: softmax (none), center (DINO, iBOT), sinkhorn (DINOv2, CAPI)
+  teacher_balance: sinkhorn
+  center_momentum: 0.9
+  # JEM entropy regularizer weight, 0 disables
+  entropy_weight: 0.0
 
 # EMA teacher momentum, linear from ema_momentum to ema_momentum_end, constant if null.
 ema_momentum: 0.996
@@ -96,7 +116,7 @@ checkpoint_period: 2500
 checkpoint_steps: null
 checkpoint_minutes: null
 
-# Logging. Teacher feature pca of plot_num_images images every plot_period steps.
+# Logging.
 print_freq: 100
 plot_period: 5000
 plot_num_images: 4
