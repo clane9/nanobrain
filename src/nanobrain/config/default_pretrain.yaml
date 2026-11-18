@@ -32,19 +32,17 @@ num_samples: 2
 # loss weight of teacher positions the student also sees (unseen positions weigh 1)
 seen_weight: 1.0
 
-# Augmentation per view, in this order. p is the probability of applying each (0 skips it),
-# strength its range: log gamma ~ U(-s, s), log bias field std s, log scale and shift ~ U(-s, s),
-# noise std ~ U(0, s), all in z units.
+# Augmentation per view, in this order.
 student_augment:
   gamma: {p: 0.5, strength: 0.5}
   bias_field: {p: 0.5, strength: 0.3}
   scale_shift: {p: 0.0, strength: 0.2}
-  noise: {p: 0.5, strength: 0.1}
+  gauss_noise: {p: 0.5, strength: 0.2}
 teacher_augment:
-  gamma: {p: 0.0, strength: 0.5}
-  bias_field: {p: 0.0, strength: 0.3}
+  gamma: {p: 0.5, strength: 0.5}
+  bias_field: {p: 0.5, strength: 0.3}
   scale_shift: {p: 0.0, strength: 0.2}
-  noise: {p: 0.0, strength: 0.1}
+  gauss_noise: {p: 0.5, strength: 0.2}
 
 # Model:
 # - jepa (smooth l1 loss, i.e. I-JEPA)
@@ -119,7 +117,9 @@ checkpoint_minutes: null
 # Logging.
 print_freq: 100
 plot_period: 5000
-plot_num_images: 4
+# teacher feature pca of plot_nrow x plot_ncol images from the current batch
+plot_nrow: 4
+plot_ncol: 4
 
 device: cuda
 seed: 7338

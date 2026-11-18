@@ -33,7 +33,7 @@ from nanobrain.data import (
 )
 from nanobrain.masking import MaskUnitViews, RandomViews
 from nanobrain.model import DINO3D, JEPA3D, patchify3d, select_tokens
-from nanobrain.visualization import plot_feature_pca
+from nanobrain.visualization import feature_pca_rgb, plot_feature_pca
 
 logger = logging.getLogger()
 
@@ -360,10 +360,14 @@ def train(
         # pca of teacher features on a few images from the current batch
         # not on stop by signal, just save and exit
         is_plot_step = args.plot_period and (step % args.plot_period == 0 or done)
-        if args.plot_num_images and is_plot_step:
-            plot_path = plot_features(args, model, batch["image"], batch["mask"], step, amp_dtype)
+        num_examples = args.plot_nrow * args.plot_ncol
+        if num_examples and is_plot_step:
+            plot_paths = plot_features(args, model, batch["image"], batch["mask"], step, amp_dtype)
             if args.wandb:
-                wandb.log({"train/feature_pca": wandb.Image(str(plot_path))}, step=step)
+                wandb.log(
+                    {f"train/{name}": wandb.Image(str(path)) for name, path in plot_paths.items()},
+                    step=step,
+                )
 
         is_save_step = step % args.checkpoint_period == 0 or step in (args.checkpoint_steps or [])
         # crossed one of the checkpoint_minutes since the last step
@@ -516,17 +520,17 @@ def plot_features(
     masks: Tensor,
     step: int,
     amp_dtype: torch.dtype,
-) -> Path:
-    """Joint pca of teacher encoder features over all brain patches of a few images."""
+) -> dict[str, Path]:
+    """Pca of teacher encoder features over all brain patches, per image, one figure per view."""
     encoder = model.teacher_encoder
     patch_size = args.patch_size
     patch_grid_size = [size // patch_size for size in args.grid_size]
-    images = images[: args.plot_num_images]
-    masks = masks[: args.plot_num_images]
+    num_examples = args.plot_nrow * args.plot_ncol
+    images = images[:num_examples]
+    masks = masks[:num_examples]
 
     # eager, the plot shapes differ from training and compiling them isn't worth it
-    features = []
-    in_masks = []
+    pca_maps = []
     with (
         torch.no_grad(),
         torch.autocast(device_type=images.device.type, dtype=amp_dtype, enabled=args.amp),
@@ -535,35 +539,26 @@ def plot_features(
             patches = patchify3d(image[None], patch_size)
             in_mask = (patchify3d(mask[None], patch_size) > 0).any(dim=2)[0]
             tokens = encoder(patches[:, in_mask], encoder.coord_grid[:, in_mask])
-            features.append(tokens[0, encoder.class_tokens :].float())
-            in_masks.append(in_mask)
+            rgb = feature_pca_rgb(tokens[0, encoder.class_tokens :].float())
+            dense = rgb.new_zeros(len(in_mask), 3)
+            dense[in_mask] = rgb
+            pca_maps.append(dense.reshape(*patch_grid_size, 3))
 
-    # top 3 pcs of the pooled tokens, each scaled to [0, 1] by its 1-99 percentiles
-    pooled = torch.cat(features)
-    mean = pooled.mean(dim=0)
-    _, _, components = torch.linalg.svd(pooled - mean, full_matrices=False)
-    projections = (pooled - mean) @ components[:3].T
-    low = projections.quantile(0.01, dim=0)
-    high = projections.quantile(0.99, dim=0)
-    colors = ((projections - low) / (high - low)).clamp(0, 1)
+    images = images.float().cpu().numpy()
+    masks = masks.cpu().numpy()
+    pca_maps = torch.stack(pca_maps).cpu().numpy()
 
-    pca_maps = []
-    start = 0
-    for in_mask in in_masks:
-        dense = colors.new_zeros(len(in_mask), 3)
-        dense[in_mask] = colors[start : start + int(in_mask.sum())]
-        start += int(in_mask.sum())
-        pca_maps.append(dense.reshape(*patch_grid_size, 3))
-
-    fig = plot_feature_pca(
-        images.float().cpu().numpy(),
-        masks.cpu().numpy(),
-        torch.stack(pca_maps).cpu().numpy(),
-    )
-    path = Path(args.output_dir) / "plots" / f"feature_pca_{step:07d}.png"
-    fig.savefig(path)
-    plt.close(fig)
-    return path
+    plot_dir = Path(args.output_dir) / "plots"
+    plot_paths = {}
+    for view in ["sag", "cor", "ax"]:
+        fig = plot_feature_pca(
+            images, masks, pca_maps, view=view, nrow=args.plot_nrow, ncol=args.plot_ncol
+        )
+        path = plot_dir / f"pca_{view}_{step:07d}.png"
+        fig.savefig(path)
+        plt.close(fig)
+        plot_paths[f"pca_{view}"] = path
+    return plot_paths
 
 
 if __name__ == "__main__":

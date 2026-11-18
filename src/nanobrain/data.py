@@ -183,6 +183,8 @@ def normalize_values(
 
 
 # Data augmentations on preprocessed (z-scored) images.
+# strength sets the range of each: log gamma ~ U(-s, s), log bias field std
+# s, log scale and shift ~ U(-s, s), noise std ~ U(0, s).
 
 
 def adjust_gamma(
@@ -220,20 +222,6 @@ def apply_bias_field(
     low = torch.where(mask, image, torch.inf).amin()
     image = (image - low) * log_field.exp() + low
     return image * mask
-
-
-def scale_shift(
-    image: Float[Tensor, "X Y Z"], mask: Tensor, scale: float, shift: float
-) -> Float[Tensor, "X Y Z"]:
-    return (image * scale + shift) * (mask > 0)
-
-
-def add_noise(image: Float[Tensor, "X Y Z"], mask: Tensor, std: float) -> Float[Tensor, "X Y Z"]:
-    return (image + std * torch.randn_like(image)) * (mask > 0)
-
-
-# Augmentation modules. strength sets the range of each: log gamma ~ U(-s, s), log bias field std
-# s, log scale and shift ~ U(-s, s), noise std ~ U(0, s).
 
 
 class RandomGamma(nn.Module):
@@ -276,21 +264,25 @@ class RandomScaleShift(nn.Module):
     def forward(self, sample: dict) -> dict:
         log_scale = torch.empty(()).uniform_(-self.strength, self.strength).item()
         shift = torch.empty(()).uniform_(-self.strength, self.strength).item()
-        image = scale_shift(sample["image"], sample["mask"], math.exp(log_scale), shift)
+        image = sample["image"]
+        mask = sample["mask"] > 0
+        image = (image * math.exp(log_scale) + shift) * mask
         return {**sample, "image": image}
 
     def extra_repr(self):
         return f"strength={self.strength}"
 
 
-class RandomNoise(nn.Module):
+class GaussianNoise(nn.Module):
     def __init__(self, strength: float = 0.1):
         super().__init__()
         self.strength = strength
 
     def forward(self, sample: dict) -> dict:
         std = torch.empty(()).uniform_(0, self.strength).item()
-        image = add_noise(sample["image"], sample["mask"], std)
+        image = sample["image"]
+        mask = sample["mask"] > 0
+        image = (image + std * torch.randn_like(image)) * mask
         return {**sample, "image": image}
 
     def extra_repr(self):
@@ -301,7 +293,7 @@ AUGMENTATIONS = {
     "gamma": RandomGamma,
     "bias_field": RandomBiasField,
     "scale_shift": RandomScaleShift,
-    "noise": RandomNoise,
+    "gauss_noise": GaussianNoise,
 }
 
 
