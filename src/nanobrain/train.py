@@ -1,4 +1,5 @@
 import argparse
+import copy
 import datetime
 import json
 import logging
@@ -24,14 +25,12 @@ from nanobrain.data import (
     Fomo300kDataset,
     InfiniteSampler,
     brle_to_dense,
-    fit_to_shape,
-    normalize_values,
-    reorient_to_ras,
-    resample_to_spacing,
+    make_augment,
+    make_preprocess,
 )
-from nanobrain.masking import mask_unit_scores
-from nanobrain.model import ViTMAE3D, patches_to_volume
-from nanobrain.visualization import plot_mask_pred
+from nanobrain.masking import make_view_sampler
+from nanobrain.model import build_model, patchify3d, select_tokens
+from nanobrain.visualization import plot_feature_pca
 
 logger = logging.getLogger()
 
@@ -89,18 +88,35 @@ def main(args: DictConfig):
     misc.snapshot_source(ROOT / "src", output_dir / "source.tar.gz")
 
     # model
-    model = ViTMAE3D.from_config(args)
+    model = build_model(args)
     model.to(device)
     logger.info(f"model:\n{model}")
+    # trained params only (student encoder, predictor, head), the teacher is an EMA copy
     num_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     logger.info(f"num params: {num_params / 1e6:.1f}M")
 
-    batch_flops = count_batch_flops(args, model, device)
-    logger.info(f"flops per batch (fwd + bwd): {batch_flops / 1e12:.2f} TFLOP")
+    # data pipeline: shared preprocessing, then independent augmentation per view
+    patch_grid_size = tuple(size // args.patch_size for size in args.grid_size)
+    view_sampler = make_view_sampler(args.views, patch_grid_size)
+    preprocess = make_preprocess(
+        tuple(args.clip_quantiles), args.target_spacing, tuple(args.grid_size)
+    )
+    student_augment = make_augment(args.student_augment)
+    teacher_augment = make_augment(args.teacher_augment)
+    logger.info(f"view sampler: {view_sampler}")
+    logger.info(f"preprocess: {preprocess}")
+    logger.info(f"student augment: {student_augment}")
+    logger.info(f"teacher augment: {teacher_augment}")
 
+    batch_flops = count_batch_flops(args, model, view_sampler, device)
+    logger.info(f"flops per batch (teacher fwd, student fwd + bwd): {batch_flops / 1e12:.2f} TFLOP")
+
+    # compile the two steps separately (as capi), the module keeps its state dict keys
+    forward_teacher = model.forward_teacher
+    forward_student = model.forward_student
     if args.compile:
-        # in place compile keeps the state dict keys
-        model.compile()
+        forward_teacher = torch.compile(forward_teacher)
+        forward_student = torch.compile(forward_student)
 
     # optimizer
     # batch size counts sequences, following mae_st which scales by repeated samples
@@ -126,6 +142,9 @@ def main(args: DictConfig):
     lr_schedule = make_lr_schedule(
         args.lr, args.min_lr, args.total_steps, args.warmup_steps, args.decay_steps
     )
+    # linear from ema_momentum to ema_momentum_end (I-JEPA 0.996 -> 1), constant if null
+    momentum_end = args.ema_momentum_end if args.ema_momentum_end is not None else args.ema_momentum
+    momentum_schedule = np.linspace(args.ema_momentum, momentum_end, args.total_steps)
     logger.info(
         f"lr schedule: total steps = {args.total_steps}, warmup = {args.warmup_steps}, "
         f"decay = {args.decay_steps}"
@@ -157,7 +176,9 @@ def main(args: DictConfig):
         prefetch_factor=args.prefetch_factor if args.num_workers > 0 else None,
         worker_init_fn=ignore_sigterm,
     )
-    batch_transform = make_batch_transform(args)
+    batch_transform = make_batch_transform(
+        args, model.encoder.coord_grid, view_sampler, preprocess, student_augment, teacher_augment
+    )
 
     # on SIGTERM (e.g. preemption) finish the current step, save and exit. resumes when relaunched
     stop_event = threading.Event()
@@ -166,11 +187,14 @@ def main(args: DictConfig):
     stats = train(
         args,
         model,
+        forward_teacher,
+        forward_student,
         train_loader,
         batch_transform,
         optimizer,
         loss_scaler,
         lr_schedule,
+        momentum_schedule,
         start_step,
         prev_wall_time,
         process_start_time,
@@ -212,11 +236,14 @@ def main(args: DictConfig):
 def train(
     args: DictConfig,
     model: nn.Module,
+    forward_teacher: Callable,
+    forward_student: Callable,
     data_loader: Iterable,
     batch_transform: Callable,
     optimizer: torch.optim.Optimizer,
     loss_scaler: torch.GradScaler | None,
     lr_schedule: np.ndarray,
+    momentum_schedule: np.ndarray,
     start_step: int,
     prev_wall_time: float,
     start_time: float,
@@ -282,19 +309,17 @@ def train(
 
         # run volume processing on gpu, not cpu workers, ~25x faster
         batch = batch_transform(batch)
-        images = batch["image"]
-        masks = batch["mask"]
-        scores = batch["scores"]
 
         with torch.autocast(device_type=device.type, dtype=amp_dtype, enabled=args.amp):
-            loss = model(
-                images,
-                masks,
-                num_visible=args.num_visible,
-                num_predict=args.num_predict,
-                num_samples=args.num_samples,
-                with_state=False,
-                scores=scores,
+            targets, teacher_state = forward_teacher(
+                batch["teacher_patches"], batch["teacher_coord"]
+            )
+            loss, student_state = forward_student(
+                batch["student_patches"],
+                batch["student_coord"],
+                batch["teacher_coord"],
+                targets,
+                batch["token_weights"],
             )
 
         loss_for_log = loss.detach()
@@ -308,8 +333,12 @@ def train(
             max_norm=args.clip_grad,
         )
 
+        if need_update:
+            model.update_teacher(float(momentum_schedule[step]))
+
         # log tensors without syncing, values are only read on log steps
-        metric_logger.update(loss=loss_for_log)
+        monitors = {**teacher_state, **student_state}
+        metric_logger.update(loss=loss_for_log, **monitors)
         if need_update:
             metric_logger.update(lr=lr, grad=grad_norm)
 
@@ -321,6 +350,7 @@ def train(
                 "loss": metric_logger.loss.value,
                 "lr": lr,
                 "grad": metric_logger.grad.value,
+                **{name: metric_logger.meters[name].value for name in monitors},
                 "vol_per_sec": metric_logger.meters["vol/s"].value,
                 "tflop_per_sec": metric_logger.meters["tflop/s"].value,
                 "watts": metric_logger.meters["watts"].value,
@@ -337,17 +367,13 @@ def train(
         done = step == total_steps or wall_time >= time_limit
         is_last = done or stop_event.is_set()
 
-        # plot a few images from the current batch
-        num_examples = args.plot_nrow * args.plot_ncol
+        # pca of teacher features on a few images from the current batch
         # not on stop by signal, just save and exit
         is_plot_step = args.plot_period and (step % args.plot_period == 0 or done)
-        if num_examples and is_plot_step:
-            plot_paths = plot_examples(args, model, images, masks, scores, step, amp_dtype, device)
+        if args.plot_num_images and is_plot_step:
+            plot_path = plot_features(args, model, batch["image"], batch["mask"], step, amp_dtype)
             if args.wandb:
-                wandb.log(
-                    {f"train/{name}": wandb.Image(str(path)) for name, path in plot_paths.items()},
-                    step=step,
-                )
+                wandb.log({"train/feature_pca": wandb.Image(str(plot_path))}, step=step)
 
         is_save_step = step % args.checkpoint_period == 0 or step in (args.checkpoint_steps or [])
         # crossed one of the checkpoint_minutes since the last step
@@ -384,139 +410,141 @@ def make_lr_schedule(
     return np.concatenate([warmup, stable, decay])
 
 
-def make_batch_transform(args: DictConfig):
-    def fn(batch: list[dict[str, Tensor]]) -> dict[str, Tensor]:
-        batch = [
-            sample_transform(
-                sample,
-                target_spacing=args.target_spacing,
-                grid_size=tuple(args.grid_size),
-                clip_quantiles=tuple(args.clip_quantiles),
-            )
-            for sample in batch
-        ]
-        images = torch.stack([sample["image"] for sample in batch])
-        masks = torch.stack([sample["mask"] for sample in batch])
+def make_batch_transform(
+    args: DictConfig,
+    coord_grid: Tensor,
+    view_sampler: Callable,
+    preprocess: nn.Module,
+    student_augment: nn.Module,
+    teacher_augment: nn.Module,
+):
+    """Raw fomo300k samples to student and teacher tokens, on gpu."""
+    patch_size = args.patch_size
 
-        if args.mask_sampler is None or args.mask_sampler == "uniform":
-            scores = None
-        elif args.mask_sampler == "mask_unit":
-            scores = mask_unit_scores(masks, args.num_samples, args.patch_size, args.mask_unit_size)
-        else:
-            raise ValueError(f"unknown mask_sampler {args.mask_sampler}")
-        return {"image": images, "mask": masks, "scores": scores}
+    def fn(batch: list[dict[str, Tensor]]) -> dict[str, Tensor]:
+        images, student_images, teacher_images, masks = [], [], [], []
+        for sample in batch:
+            sample = {
+                "values": sample["values"].float() * sample["scale"],
+                "mask": brle_to_dense(sample["mask_rle"], shape=sample["shape"]),
+                "affine": sample["affine"],
+            }
+            sample = preprocess(sample)
+            images.append(sample["image"])
+            masks.append(sample["mask"])
+            student_images.append(student_augment(sample)["image"])
+            teacher_images.append(teacher_augment(sample)["image"])
+        images = torch.stack(images)
+        masks = torch.stack(masks)
+        student_images = torch.stack(student_images)
+        teacher_images = torch.stack(teacher_images)
+
+        mask_frac = patchify3d(masks, patch_size).mean(dim=2)
+        student_ids, teacher_ids = view_sampler(mask_frac, args.num_samples)
+        student_patches, student_coord = select_tokens(
+            student_images, student_ids, coord_grid, patch_size
+        )
+        teacher_patches, teacher_coord = select_tokens(
+            teacher_images, teacher_ids, coord_grid, patch_size
+        )
+        # teacher positions the student also sees get seen_weight, the others 1
+        seen = (teacher_ids[..., :, None] == student_ids[..., None, :]).any(dim=-1)
+        token_weights = torch.where(seen.flatten(0, 1), args.seen_weight, 1.0)
+        return {
+            "image": images,
+            "mask": masks,
+            "student_patches": student_patches,
+            "student_coord": student_coord,
+            "teacher_patches": teacher_patches,
+            "teacher_coord": teacher_coord,
+            "token_weights": token_weights,
+        }
 
     return fn
 
 
-def sample_transform(
-    sample: dict[str, Tensor],
-    *,
-    target_spacing: float = 1.0,
-    grid_size: tuple[int, int, int] = (192, 240, 192),
-    clip_quantiles: tuple[float, float] = (0.005, 0.995),
-) -> dict[str, Tensor]:
-    # pretraining preprocessing, on gpu. eval preprocessing is ViTMAE3D.transform_cuda, keep in sync
-    values = sample["values"].float() * sample["scale"]
-    values = normalize_values(values, clip_quantiles)
-    mask = brle_to_dense(sample["mask_rle"], shape=sample["shape"])
-    image = values.new_zeros(mask.shape).masked_scatter_(mask, values)
-    image, mask, affine = reorient_to_ras(image, mask, sample["affine"])
-    image, mask, affine = resample_to_spacing(image, mask, affine, target_spacing)
-    image, mask, affine = fit_to_shape(image, mask, affine, grid_size)
-    return {"image": image, "mask": mask, "affine": affine}
-
-
-def count_batch_flops(args: DictConfig, model: nn.Module, device: torch.device) -> float:
-    # fwd + bwd flops of one training batch, on dummy images where every patch is in the mask
+def count_batch_flops(
+    args: DictConfig, model: nn.Module, view_sampler: Callable, device: torch.device
+) -> float:
+    # one training step on dummy images where every patch is in the mask. on a copy, so buffers
+    # like the teacher center are untouched
+    model = copy.deepcopy(model)
     amp_dtype = getattr(torch, args.amp_dtype)
     images = torch.zeros(args.batch_size, *args.grid_size, device=device)
     masks = torch.ones(args.batch_size, *args.grid_size, device=device)
+    mask_frac = patchify3d(masks, args.patch_size).mean(dim=2)
+    student_ids, teacher_ids = view_sampler(mask_frac, args.num_samples)
+    coord_grid = model.encoder.coord_grid
+    student_patches, student_coord = select_tokens(images, student_ids, coord_grid, args.patch_size)
+    teacher_patches, teacher_coord = select_tokens(images, teacher_ids, coord_grid, args.patch_size)
+    token_weights = torch.ones(teacher_patches.shape[:2], device=device)
+
     flop_counter = FlopCounterMode(display=False)
     with flop_counter:
         with torch.autocast(device_type=device.type, dtype=amp_dtype, enabled=args.amp):
-            loss = model(
-                images,
-                masks,
-                num_visible=args.num_visible,
-                num_predict=args.num_predict,
-                num_samples=args.num_samples,
-                with_state=False,
+            targets, _ = model.forward_teacher(teacher_patches, teacher_coord)
+            loss, _ = model.forward_student(
+                student_patches, student_coord, teacher_coord, targets, token_weights
             )
         loss.backward()
-    model.zero_grad(set_to_none=True)
     return flop_counter.get_total_flops()
 
 
-def plot_examples(
+def plot_features(
     args: DictConfig,
     model: nn.Module,
     images: Tensor,
     masks: Tensor,
-    scores: Tensor | None,
     step: int,
     amp_dtype: torch.dtype,
-    device: torch.device,
-) -> dict[str, Path]:
-    num_examples = args.plot_nrow * args.plot_ncol
-    images = images[:num_examples]
-    masks = masks[:num_examples]
-    if scores is not None:
-        scores = scores[:num_examples, :1]
+) -> Path:
+    """Joint pca of teacher encoder features over all brain patches of a few images."""
+    encoder = model.teacher_encoder
+    patch_size = args.patch_size
+    patch_grid_size = [size // patch_size for size in args.grid_size]
+    images = images[: args.plot_num_images]
+    masks = masks[: args.plot_num_images]
 
-    model.eval()
     # eager, the plot shapes differ from training and compiling them isn't worth it
+    features = []
+    in_masks = []
     with (
         torch.no_grad(),
-        torch.autocast(device_type=device.type, dtype=amp_dtype, enabled=args.amp),
-        torch.compiler.set_stance("force_eager"),
+        torch.autocast(device_type=images.device.type, dtype=amp_dtype, enabled=args.amp),
     ):
-        _, state = model(
-            images,
-            masks,
-            num_visible=args.num_visible,
-            num_predict=args.plot_num_predict,
-            num_samples=1,
-            scores=scores,
-        )
-    model.train()
+        for image, mask in zip(images, masks):
+            patches = patchify3d(image[None], patch_size)
+            in_mask = (patchify3d(mask[None], patch_size) > 0).any(dim=2)[0]
+            tokens = encoder(patches[:, in_mask], encoder.coord_grid[:, in_mask])
+            features.append(tokens[0].float())
+            in_masks.append(in_mask)
 
-    grid_size = tuple(args.grid_size)
-    patch_size = args.patch_size
-    vis_ids = state["vis_ids"]
-    target_ids = state["target_ids"]
-    pred = patches_to_volume(state["pred_patches"].float(), target_ids, grid_size, patch_size)
-    visible_mask = patches_to_volume(
-        torch.ones_like(state["vis_patches"]), vis_ids, grid_size, patch_size
+    # top 3 pcs of the pooled tokens, each scaled to [0, 1] by its 1-99 percentiles
+    pooled = torch.cat(features)
+    mean = pooled.mean(dim=0)
+    _, _, components = torch.linalg.svd(pooled - mean, full_matrices=False)
+    projections = (pooled - mean) @ components[:3].T
+    low = projections.quantile(0.01, dim=0)
+    high = projections.quantile(0.99, dim=0)
+    colors = ((projections - low) / (high - low)).clamp(0, 1)
+
+    pca_maps = []
+    start = 0
+    for in_mask in in_masks:
+        dense = colors.new_zeros(len(in_mask), 3)
+        dense[in_mask] = colors[start : start + int(in_mask.sum())]
+        start += int(in_mask.sum())
+        pca_maps.append(dense.reshape(*patch_grid_size, 3))
+
+    fig = plot_feature_pca(
+        images.float().cpu().numpy(),
+        masks.cpu().numpy(),
+        torch.stack(pca_maps).cpu().numpy(),
     )
-    pred_mask = patches_to_volume(
-        torch.ones_like(state["target_patches"]), target_ids, grid_size, patch_size
-    )
-
-    images = images.float().cpu().numpy()
-    masks = masks.cpu().numpy()
-    pred = pred.cpu().numpy()
-    visible_mask = visible_mask.cpu().numpy()
-    pred_mask = pred_mask.cpu().numpy()
-
-    plot_dir = Path(args.output_dir) / "plots"
-    plot_paths = {}
-    for view in ["sag", "cor", "ax"]:
-        fig = plot_mask_pred(
-            images,
-            pred,
-            visible_mask,
-            pred_mask=pred_mask,
-            img_mask=masks,
-            view=view,
-            nrow=args.plot_nrow,
-            ncol=args.plot_ncol,
-        )
-        path = plot_dir / f"mae_{view}_{step:07d}.png"
-        fig.savefig(path)
-        plt.close(fig)
-        plot_paths[f"mae_{view}"] = path
-    return plot_paths
+    path = Path(args.output_dir) / "plots" / f"feature_pca_{step:07d}.png"
+    fig.savefig(path)
+    plt.close(fig)
+    return path
 
 
 if __name__ == "__main__":

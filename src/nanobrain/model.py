@@ -1,13 +1,17 @@
+import copy
+
 import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from brainmarks_smri.models import EmbeddingOutput, ImageInput, register_model
 from einops import rearrange
+from jaxtyping import Float, Int
 from torch import Tensor
 from torch.nn.attention import SDPBackend, sdpa_kernel
-from jaxtyping import Float, Int
 
+from .data import crop_to_mask, make_preprocess
+from .losses import PrototypeCELoss, PrototypeHead, entropy_regularizer, sinkhorn_knopp
 from .modules import (
     Block,
     LayerNorm,
@@ -15,17 +19,12 @@ from .modules import (
     SeparablePosEmbed3D,
     SinCosPosEmbed3D,
 )
-from .data import (
-    crop_to_mask,
-    fit_to_shape,
-    normalize_values,
-    reorient_to_ras,
-    resample_to_spacing,
-)
 
 
-class ViTMAE3D(nn.Module):
-    name = "vit_mae_3d"
+class ViTEncoder3D(nn.Module):
+    """ViT over a subset of patch tokens. Also implements the brainmarks model contract."""
+
+    name = "vit_encoder_3d"
 
     def __init__(
         self,
@@ -35,16 +34,11 @@ class ViTMAE3D(nn.Module):
         depth: int = 12,
         embed_dim: int = 768,
         num_heads: int = 12,
-        decoder_depth: int = 4,
-        decoder_embed_dim: int = 512,
-        decoder_num_heads: int = 8,
         qkv_bias: bool = True,
         proj_bias: bool = True,
         mlp_ratio: int | float = 4,
-        class_tokens: int = 1,
         drop_path_rate: float = 0.0,
         clip_quantiles: tuple[float, float] = (0.005, 0.995),
-        min_mask_frac: float = 0.25,
         pos_embed: str = "learned_sep",
     ):
         super().__init__()
@@ -53,20 +47,16 @@ class ViTMAE3D(nn.Module):
         # tuple for the brainmarks-smri model contract
         self.patch_size = (patch_size, patch_size, patch_size)
         self.embed_dim = embed_dim
-        self.class_tokens = class_tokens
-        patch_grid_size = tuple(size // patch_size for size in grid_size)
         self.clip_quantiles = clip_quantiles
-        self.min_mask_frac = min_mask_frac
         self.pos_embed_type = pos_embed
+        patch_grid_size = tuple(size // patch_size for size in grid_size)
 
-        patch_dim = patch_size**3
         # patch center coords in mm, relative to the volume center
         coord_grid = make_coord_grid(grid_size, patch_size, target_spacing)
         self.register_buffer("coord_grid", coord_grid, persistent=False)
         unit = patch_size * target_spacing
 
-        # encoder
-        self.patch_embed = nn.Linear(patch_dim, embed_dim)
+        self.patch_embed = nn.Linear(patch_size**3, embed_dim)
         if pos_embed == "learned_sep":
             self.pos_embed = SeparablePosEmbed3D(patch_grid_size, embed_dim, unit=unit)
         elif pos_embed == "sincos":
@@ -76,14 +66,8 @@ class ViTMAE3D(nn.Module):
         else:
             raise ValueError(f"unknown pos_embed {pos_embed}")
         pos_embed_layer = Rope3D if pos_embed == "rope_axial" else None
-        if class_tokens:
-            self.cls_token = nn.Parameter(torch.empty(1, class_tokens, embed_dim))
-        else:
-            self.cls_token = None
 
-        # stochastic depth decay rule
         dpr = [x.item() for x in torch.linspace(0, drop_path_rate, depth)]
-
         self.blocks = nn.ModuleList(
             [
                 Block(
@@ -99,175 +83,24 @@ class ViTMAE3D(nn.Module):
             ]
         )
         self.norm = LayerNorm(embed_dim)
-
-        # decoder
-        self.decoder_proj = nn.Linear(embed_dim, decoder_embed_dim)
-        if pos_embed == "learned_sep":
-            self.decoder_pos_embed = SeparablePosEmbed3D(
-                patch_grid_size, decoder_embed_dim, unit=unit
-            )
-        elif pos_embed == "sincos":
-            self.decoder_pos_embed = SinCosPosEmbed3D(patch_grid_size, decoder_embed_dim, unit=unit)
-        else:
-            self.decoder_pos_embed = None
-        self.mask_token = nn.Parameter(torch.empty(1, 1, decoder_embed_dim))
-
-        self.decoder_blocks = nn.ModuleList(
-            [
-                Block(
-                    dim=decoder_embed_dim,
-                    num_heads=decoder_num_heads,
-                    qkv_bias=qkv_bias,
-                    proj_bias=proj_bias,
-                    mlp_ratio=mlp_ratio,
-                    pos_embed_layer=pos_embed_layer,
-                )
-                for ii in range(decoder_depth)
-            ]
-        )
-
-        self.decoder_norm = LayerNorm(decoder_embed_dim)
-        self.decoder_head = nn.Linear(decoder_embed_dim, patch_dim)
-        self.init_weights()
-
-    @classmethod
-    def from_config(cls, args: dict) -> "ViTMAE3D":
-        return cls(
-            grid_size=tuple(args["grid_size"]),
-            target_spacing=args["target_spacing"],
-            clip_quantiles=tuple(args["clip_quantiles"]),
-            patch_size=args["patch_size"],
-            **args["model_kwargs"],
-        )
+        self.preprocess = make_preprocess(clip_quantiles, target_spacing, grid_size)
+        self.apply(_init_weights)
 
     def extra_repr(self):
-        return (
-            f"{self.grid_size}, {self.patch_size}, class_tokens={self.class_tokens}, "
-            f"pos_embed={self.pos_embed_type}"
-        )
+        return f"{self.grid_size}, {self.patch_size}, pos_embed={self.pos_embed_type}"
 
-    def init_weights(self):
-        self.apply(_init_weights)
-        if self.class_tokens:
-            nn.init.normal_(self.cls_token, std=0.02)
-        nn.init.normal_(self.mask_token, std=0.02)
-        # initialize the decoder head to zero to prevent hockey stick
-        self.decoder_head.weight.data.mul_(0.0)
-
-    def forward_encoder(
+    def forward(
         self,
         patches: Float[Tensor, "B N P"],
         coord: Float[Tensor, "B N 3"],
-    ) -> Float[Tensor, "B R+N D"]:
-        B, N, P = patches.shape
-        assert coord.shape == (B, N, 3)
-
+    ) -> Float[Tensor, "B N D"]:
         x = self.patch_embed(patches)
         if self.pos_embed is not None:
             x = self.pos_embed(x, coord)
-
-        if self.class_tokens:
-            x = torch.cat([self.cls_token.expand(B, -1, -1), x], dim=1)
-            # class tokens at the center, i.e. not rotated by rope
-            coord = F.pad(coord, (0, 0, self.class_tokens, 0))
-
         for block in self.blocks:
             x = block(x, coord=coord)
         x = self.norm(x)
         return x
-
-    def forward_decoder(
-        self,
-        embeds: Float[Tensor, "B R+N D"],
-        coord: Float[Tensor, "B N 3"],
-        target_coord: Float[Tensor, "B M 3"],
-    ) -> Float[Tensor, "B M P"]:
-        B = embeds.shape[0]
-        M = target_coord.shape[1]
-        assert target_coord.shape == (B, M, 3)
-
-        embeds = self.decoder_proj(embeds)
-        mask_tokens = self.mask_token.expand(B, M, -1)
-
-        if self.decoder_pos_embed is not None:
-            mask_tokens = self.decoder_pos_embed(mask_tokens, target_coord)
-
-        x = torch.cat([embeds, mask_tokens], dim=1)
-        coord = torch.cat([coord, target_coord], dim=1)
-        if self.class_tokens:
-            coord = F.pad(coord, (0, 0, self.class_tokens, 0))
-
-        for block in self.decoder_blocks:
-            x = block(x, coord=coord)
-
-        x = x[:, -M:]
-        x = self.decoder_norm(x)
-        x = self.decoder_head(x)
-        return x
-
-    def forward(
-        self,
-        images: Float[Tensor, "B X Y Z"],
-        mask: Float[Tensor, "B X Y Z"],
-        num_visible: int,
-        num_predict: int | None = None,
-        num_samples: int = 1,
-        with_state: bool = True,
-        scores: Float[Tensor, "B S N"] | None = None,
-    ):
-        B = images.shape[0]
-        assert tuple(images.shape[1:]) == tuple(self.grid_size)
-
-        patches = patchify3d(images, self.patch_size[0])
-        mask_patches = patchify3d(mask, self.patch_size[0])
-        coord = self.coord_grid.expand(B, -1, -1)
-
-        # sample num_samples sequences per image, then flatten them into the batch
-        visible_ids, predict_ids = sample_sequences(
-            mask_patches,
-            num_visible,
-            num_predict,
-            num_samples,
-            scores,
-            min_mask_frac=self.min_mask_frac,
-        )
-        order = torch.cat([visible_ids, predict_ids], dim=2)
-        num_predict = predict_ids.shape[2]
-        batch_ids = torch.arange(B, device=images.device)[:, None, None]
-        patches = patches[batch_ids, order].flatten(0, 1)
-        mask_patches = mask_patches[batch_ids, order].flatten(0, 1)
-        coord = coord[batch_ids, order].flatten(0, 1)
-
-        vis_patches, target_patches = torch.split(patches, [num_visible, num_predict], dim=1)
-        vis_mask_patches, target_mask_patches = torch.split(
-            mask_patches, [num_visible, num_predict], dim=1
-        )
-        vis_coord, target_coord = torch.split(coord, [num_visible, num_predict], dim=1)
-
-        embeds = self.forward_encoder(vis_patches, vis_coord)
-        pred_patches = self.forward_decoder(embeds, vis_coord, target_coord)
-        loss = F.mse_loss(pred_patches, target_patches, reduction="none")
-        loss = (target_mask_patches * loss).sum() / target_mask_patches.sum()
-
-        if not with_state:
-            return loss
-
-        patch_ids = order.flatten(0, 1)
-        image_ids = torch.arange(B, device=images.device).repeat_interleave(num_samples)
-        vis_ids, target_ids = torch.split(patch_ids, [num_visible, num_predict], dim=1)
-
-        state = {
-            "vis_patches": vis_patches,
-            "target_patches": target_patches,
-            "vis_mask_patches": vis_mask_patches,
-            "target_mask_patches": target_mask_patches,
-            "embeds": embeds,
-            "pred_patches": pred_patches,
-            "vis_ids": vis_ids,
-            "target_ids": target_ids,
-            "image_ids": image_ids,
-        }
-        return loss, state
 
     # the methods below implement the brainmarks model contract.
     #   - forward_embeddings: computes a global and dense embedding per input sample
@@ -282,15 +115,7 @@ class ViTMAE3D(nn.Module):
         return {"values": image[mask], "mask": mask, "affine": affine}
 
     def transform_cuda(self, sample: dict[str, Tensor]) -> dict:
-        values = sample["values"]
-        mask = sample["mask"]
-        affine = sample["affine"]
-        values = normalize_values(values, self.clip_quantiles)
-        image = values.new_zeros(mask.shape).masked_scatter_(mask, values)
-        image, mask, affine = reorient_to_ras(image, mask, affine)
-        image, mask, affine = resample_to_spacing(image, mask, affine, self.target_spacing)
-        image, mask, affine = fit_to_shape(image, mask, affine, self.grid_size)
-        return {"image": image, "mask": mask, "affine": affine}
+        return self.preprocess(sample)
 
     @torch.inference_mode()
     def forward_embeddings(
@@ -315,8 +140,8 @@ class ViTMAE3D(nn.Module):
                 sdpa_kernel([SDPBackend.FLASH_ATTENTION, SDPBackend.EFFICIENT_ATTENTION]),
                 torch.autocast(device.type, dtype=torch.bfloat16, enabled=device.type == "cuda"),
             ):
-                tokens = self.forward_encoder(patches[:, in_mask], self.coord_grid[:, in_mask])
-            tokens = tokens[0, self.class_tokens :].float()
+                tokens = self(patches[:, in_mask], self.coord_grid[:, in_mask])
+            tokens = tokens[0].float()
 
             output = EmbeddingOutput(
                 global_embedding=tokens.mean(dim=0),
@@ -334,53 +159,343 @@ class ViTMAE3D(nn.Module):
         return outputs
 
 
+class Predictor3D(nn.Module):
+    """Predicts tokens at query positions from encoder tokens.
+
+    self_attn: queries and projected encoder tokens attend jointly (MAE decoder, I-JEPA).
+    cross_attn: queries attend only to the encoder tokens, so each prediction is independent
+        (CAPI). Keys and values are projected from the encoder width directly.
+    """
+
+    def __init__(
+        self,
+        grid_size: tuple[int, int, int],
+        patch_size: int,
+        target_spacing: float,
+        embed_dim: int,
+        out_dim: int,
+        depth: int = 4,
+        predictor_dim: int = 512,
+        num_heads: int = 8,
+        qkv_bias: bool = True,
+        proj_bias: bool = True,
+        mlp_ratio: int | float = 4,
+        attn_type: str = "self_attn",
+        pos_embed: str = "learned_sep",
+    ):
+        super().__init__()
+        assert attn_type in ("self_attn", "cross_attn"), f"unknown attn_type {attn_type}"
+        self.attn_type = attn_type
+        patch_grid_size = tuple(size // patch_size for size in grid_size)
+        unit = patch_size * target_spacing
+
+        self.proj = nn.Linear(embed_dim, predictor_dim) if attn_type == "self_attn" else None
+        self.mask_token = nn.Parameter(torch.empty(1, 1, predictor_dim))
+        # added to the queries only, the encoder tokens already carry position
+        if pos_embed == "learned_sep":
+            self.pos_embed = SeparablePosEmbed3D(patch_grid_size, predictor_dim, unit=unit)
+        elif pos_embed == "sincos":
+            self.pos_embed = SinCosPosEmbed3D(patch_grid_size, predictor_dim, unit=unit)
+        else:
+            self.pos_embed = None
+        pos_embed_layer = Rope3D if pos_embed == "rope_axial" else None
+
+        context_dim = embed_dim if attn_type == "cross_attn" else None
+        self.blocks = nn.ModuleList(
+            [
+                Block(
+                    dim=predictor_dim,
+                    num_heads=num_heads,
+                    qkv_bias=qkv_bias,
+                    proj_bias=proj_bias,
+                    context_dim=context_dim,
+                    mlp_ratio=mlp_ratio,
+                    pos_embed_layer=pos_embed_layer,
+                )
+                for _ in range(depth)
+            ]
+        )
+        self.norm = LayerNorm(predictor_dim)
+        self.head = nn.Linear(predictor_dim, out_dim)
+        self.apply(_init_weights)
+        nn.init.normal_(self.mask_token, std=0.02)
+
+    def extra_repr(self):
+        return f"attn_type={self.attn_type}"
+
+    def forward(
+        self,
+        context: Float[Tensor, "B N D"],
+        context_coord: Float[Tensor, "B N 3"],
+        query_coord: Float[Tensor, "B M 3"],
+    ) -> Float[Tensor, "B M O"]:
+        B, M, _ = query_coord.shape
+        queries = self.mask_token.expand(B, M, -1)
+        if self.pos_embed is not None:
+            queries = self.pos_embed(queries, query_coord)
+
+        if self.attn_type == "self_attn":
+            x = torch.cat([self.proj(context), queries], dim=1)
+            coord = torch.cat([context_coord, query_coord], dim=1)
+            for block in self.blocks:
+                x = block(x, coord=coord)
+            x = x[:, -M:]
+        else:
+            x = queries
+            for block in self.blocks:
+                x = block(x, context=context, coord=query_coord, context_coord=context_coord)
+
+        x = self.norm(x)
+        x = self.head(x)
+        return x
+
+
+# Latent prediction models. Each has a student (encoder, predictor, optional head) and an EMA
+# teacher (encoder, optional head), with forward_teacher and forward_student called separately
+# from the training loop (as capi do_teacher / do_student). Token weights let the loss weight
+# student-visible and unseen positions differently.
+
+
+class JEPA3D(nn.Module):
+    """I-JEPA: smooth l1 between predictions and layer-normed teacher tokens."""
+
+    def __init__(
+        self,
+        grid_size: tuple[int, int, int] = (192, 240, 192),
+        target_spacing: float = 1.0,
+        patch_size: int = 8,
+        clip_quantiles: tuple[float, float] = (0.005, 0.995),
+        encoder_kwargs: dict | None = None,
+        predictor_kwargs: dict | None = None,
+    ):
+        super().__init__()
+        self.encoder = ViTEncoder3D(
+            grid_size=grid_size,
+            target_spacing=target_spacing,
+            patch_size=patch_size,
+            clip_quantiles=clip_quantiles,
+            **(encoder_kwargs or {}),
+        )
+        embed_dim = self.encoder.embed_dim
+        self.predictor = Predictor3D(
+            grid_size=grid_size,
+            patch_size=patch_size,
+            target_spacing=target_spacing,
+            embed_dim=embed_dim,
+            out_dim=embed_dim,
+            pos_embed=self.encoder.pos_embed_type,
+            **(predictor_kwargs or {}),
+        )
+        self.teacher_encoder = copy.deepcopy(self.encoder).requires_grad_(False)
+
+    def train(self, mode: bool = True):
+        # the teacher always runs in eval mode, e.g. no drop path (as capi)
+        super().train(mode)
+        self.teacher_encoder.eval()
+        return self
+
+    @torch.no_grad()
+    def update_teacher(self, momentum: float):
+        student_params = list(self.encoder.parameters())
+        teacher_params = list(self.teacher_encoder.parameters())
+        torch._foreach_mul_(teacher_params, momentum)
+        torch._foreach_add_(teacher_params, student_params, alpha=1 - momentum)
+
+    @torch.no_grad()
+    def forward_teacher(
+        self, patches: Float[Tensor, "B M P"], coord: Float[Tensor, "B M 3"]
+    ) -> tuple[Float[Tensor, "B M D"], dict[str, Tensor]]:
+        tokens = self.teacher_encoder(patches, coord)
+        targets = F.layer_norm(tokens, (tokens.shape[-1],))
+        # collapse monitor: feature std across tokens, before the layer norm
+        state = {"teacher_std": tokens.float().std(dim=(0, 1)).mean()}
+        return targets, state
+
+    def forward_student(
+        self,
+        patches: Float[Tensor, "B N P"],
+        coord: Float[Tensor, "B N 3"],
+        target_coord: Float[Tensor, "B M 3"],
+        targets: Float[Tensor, "B M D"],
+        token_weights: Float[Tensor, "B M"],
+    ) -> tuple[Tensor, dict[str, Tensor]]:
+        tokens = self.encoder(patches, coord)
+        pred = self.predictor(tokens, coord, target_coord)
+        loss = F.smooth_l1_loss(pred.float(), targets.float(), reduction="none").mean(dim=-1)
+        loss = (loss * token_weights).sum() / token_weights.sum()
+        state = {"student_std": tokens.detach().float().std(dim=(0, 1)).mean()}
+        return loss, state
+
+
+class PrototypeCE3D(nn.Module):
+    """iBOT / DINOv2 / JEM: cross entropy from teacher to student prototype distributions.
+
+    teacher_balance: softmax (JEM, no balancing), center (DINO / iBOT), sinkhorn (DINOv2).
+    entropy_weight: JEM's R_global on the student distributions, 0 disables.
+    """
+
+    def __init__(
+        self,
+        grid_size: tuple[int, int, int] = (192, 240, 192),
+        target_spacing: float = 1.0,
+        patch_size: int = 8,
+        clip_quantiles: tuple[float, float] = (0.005, 0.995),
+        encoder_kwargs: dict | None = None,
+        predictor_kwargs: dict | None = None,
+        head_kwargs: dict | None = None,
+        student_temp: float = 0.1,
+        teacher_temp: float = 0.1,
+        teacher_balance: str = "softmax",
+        center_momentum: float = 0.9,
+        entropy_weight: float = 0.0,
+    ):
+        super().__init__()
+        assert teacher_balance in ("softmax", "center", "sinkhorn")
+        self.teacher_temp = teacher_temp
+        self.teacher_balance = teacher_balance
+        self.entropy_weight = entropy_weight
+
+        self.encoder = ViTEncoder3D(
+            grid_size=grid_size,
+            target_spacing=target_spacing,
+            patch_size=patch_size,
+            clip_quantiles=clip_quantiles,
+            **(encoder_kwargs or {}),
+        )
+        embed_dim = self.encoder.embed_dim
+        # the predictor outputs encoder sized tokens, then the shared head design (iBOT applies
+        # its head to encoder outputs)
+        self.predictor = Predictor3D(
+            grid_size=grid_size,
+            patch_size=patch_size,
+            target_spacing=target_spacing,
+            embed_dim=embed_dim,
+            out_dim=embed_dim,
+            pos_embed=self.encoder.pos_embed_type,
+            **(predictor_kwargs or {}),
+        )
+        self.head = PrototypeHead(embed_dim, **(head_kwargs or {}))
+        self.loss = PrototypeCELoss(self.head.num_prototypes, student_temp, center_momentum)
+        self.teacher_encoder = copy.deepcopy(self.encoder).requires_grad_(False)
+        self.teacher_head = copy.deepcopy(self.head).requires_grad_(False)
+
+    def train(self, mode: bool = True):
+        # the teacher always runs in eval mode, e.g. no drop path (as capi)
+        super().train(mode)
+        self.teacher_encoder.eval()
+        self.teacher_head.eval()
+        return self
+
+    @torch.no_grad()
+    def update_teacher(self, momentum: float):
+        student_params = list(self.encoder.parameters()) + list(self.head.parameters())
+        teacher_params = list(self.teacher_encoder.parameters()) + list(
+            self.teacher_head.parameters()
+        )
+        torch._foreach_mul_(teacher_params, momentum)
+        torch._foreach_add_(teacher_params, student_params, alpha=1 - momentum)
+
+    @torch.no_grad()
+    def forward_teacher(
+        self, patches: Float[Tensor, "B M P"], coord: Float[Tensor, "B M 3"]
+    ) -> tuple[Float[Tensor, "B M K"], dict[str, Tensor]]:
+        tokens = self.teacher_encoder(patches, coord)
+        logits = self.teacher_head(tokens).float()
+        if self.teacher_balance == "softmax":
+            probs = F.softmax(logits / self.teacher_temp, dim=-1)
+        elif self.teacher_balance == "center":
+            probs = self.loss.softmax_center_teacher(logits, self.teacher_temp)
+            self.loss.update_center(logits)
+        else:
+            probs = sinkhorn_knopp(logits.flatten(0, 1), self.teacher_temp)
+            probs = probs.unflatten(0, logits.shape[:2])
+
+        # collapse monitors: entropy of the mean teacher distribution, and of single tokens
+        mean_probs = probs.flatten(0, 1).mean(dim=0)
+        state = {
+            "teacher_std": tokens.float().std(dim=(0, 1)).mean(),
+            "teacher_marginal_entropy": -(mean_probs * mean_probs.clamp_min(1e-12).log()).sum(),
+            "teacher_token_entropy": -(probs * probs.clamp_min(1e-12).log()).sum(dim=-1).mean(),
+        }
+        return probs, state
+
+    def forward_student(
+        self,
+        patches: Float[Tensor, "B N P"],
+        coord: Float[Tensor, "B N 3"],
+        target_coord: Float[Tensor, "B M 3"],
+        targets: Float[Tensor, "B M K"],
+        token_weights: Float[Tensor, "B M"],
+    ) -> tuple[Tensor, dict[str, Tensor]]:
+        tokens = self.encoder(patches, coord)
+        pred = self.predictor(tokens, coord, target_coord)
+        logits = self.head(pred)
+        loss = self.loss(logits, targets)
+        loss = (loss * token_weights).sum() / token_weights.sum()
+        state = {"student_std": tokens.detach().float().std(dim=(0, 1)).mean()}
+        if self.entropy_weight:
+            entropy_loss = entropy_regularizer(logits, self.loss.student_temp)
+            loss = loss + self.entropy_weight * entropy_loss
+            state["entropy_loss"] = entropy_loss.detach()
+        return loss, state
+
+
+MODELS = {"jepa": JEPA3D, "prototype_ce": PrototypeCE3D}
+
+
+def build_model(args: dict) -> nn.Module:
+    model_class = MODELS[args["model"]]
+    return model_class(
+        grid_size=tuple(args["grid_size"]),
+        target_spacing=args["target_spacing"],
+        clip_quantiles=tuple(args["clip_quantiles"]),
+        patch_size=args["patch_size"],
+        **args["model_kwargs"],
+    )
+
+
 @register_model
-def vit_mae_3d(checkpoint: str, random_weights: bool = False, **kwargs) -> ViTMAE3D:
+def vit_latent_3d(
+    checkpoint: str, encoder: str = "teacher", random_weights: bool = False
+) -> ViTEncoder3D:
+    """Eval loader: the teacher (EMA) or student encoder of a latent prediction checkpoint."""
     ckpt = torch.load(checkpoint, map_location="cpu", weights_only=True)
     args = ckpt["args"]
-    # override the checkpoint's model_kwargs
-    args["model_kwargs"].update(kwargs)
-    model = ViTMAE3D.from_config(args)
+    model = ViTEncoder3D(
+        grid_size=tuple(args["grid_size"]),
+        target_spacing=args["target_spacing"],
+        clip_quantiles=tuple(args["clip_quantiles"]),
+        patch_size=args["patch_size"],
+        **args["model_kwargs"].get("encoder_kwargs", {}),
+    )
     if not random_weights:
-        model.load_state_dict(ckpt["model"])
+        prefix = {"teacher": "teacher_encoder.", "student": "encoder."}[encoder]
+        state = {
+            k.removeprefix(prefix): v for k, v in ckpt["model"].items() if k.startswith(prefix)
+        }
+        model.load_state_dict(state)
     return model
+
+
+def select_tokens(
+    images: Float[Tensor, "B X Y Z"],
+    patch_ids: Int[Tensor, "B S N"],
+    coord_grid: Float[Tensor, "1 L 3"],
+    patch_size: int,
+) -> tuple[Float[Tensor, "BS N P"], Float[Tensor, "BS N 3"]]:
+    """Patches and coords at patch_ids, with the S samples per image flattened into the batch."""
+    B = images.shape[0]
+    patches = patchify3d(images, patch_size)
+    batch_ids = torch.arange(B, device=images.device)[:, None, None]
+    patches = patches[batch_ids, patch_ids].flatten(0, 1)
+    coord = coord_grid.expand(B, -1, -1)[batch_ids, patch_ids].flatten(0, 1)
+    return patches, coord
 
 
 def patchify3d(x: Tensor, patch_size: int = 8) -> Tensor:
     p = patch_size
     x = rearrange(x, "b (gx px) (gy py) (gz pz) -> b (gx gy gz) (px py pz)", px=p, py=p, pz=p)
     return x
-
-
-def unpatchify3d(x: Tensor, grid_size: tuple[int, int, int], patch_size: int = 8) -> Tensor:
-    p = patch_size
-    gx, gy, gz = [size // patch_size for size in grid_size]
-    x = rearrange(
-        x,
-        "b (gx gy gz) (px py pz) -> b (gx px) (gy py) (gz pz)",
-        gx=gx,
-        gy=gy,
-        gz=gz,
-        px=p,
-        py=p,
-        pz=p,
-    )
-    return x
-
-
-def patches_to_volume(
-    patches: Float[Tensor, "B L P"],
-    patch_ids: Int[Tensor, "B L"],
-    grid_size: tuple[int, int, int],
-    patch_size: int = 8,
-) -> Float[Tensor, "B X Y Z"]:
-    B, L, P = patches.shape
-    gx, gy, gz = [size // patch_size for size in grid_size]
-    grid = patches.new_zeros(B, gx * gy * gz, P)
-    batch_ids = torch.arange(B, device=patches.device)[:, None]
-    grid[batch_ids, patch_ids] = patches
-    images = unpatchify3d(grid, grid_size=grid_size, patch_size=patch_size)
-    return images
 
 
 def make_coord_grid(
@@ -396,39 +511,6 @@ def make_coord_grid(
     center = (torch.tensor(patch_grid_size, device=device) - 1) / 2
     coords = (coords - center) * patch_size * spacing
     return coords
-
-
-def sample_sequences(
-    mask_patches: Tensor,
-    num_visible: int,
-    num_predict: int | None,
-    num_samples: int = 1,
-    scores: Tensor | None = None,
-    min_mask_frac: float = 0.25,
-) -> tuple[Tensor, Tensor]:
-    batch_size, num_patches, _ = mask_patches.shape
-    mask_frac = mask_patches.mean(dim=2)
-    in_mask = mask_frac[:, None, :] >= min_mask_frac
-    if num_predict is None:
-        # one host sync to get the longest mask sequence in the batch
-        num_predict = (mask_frac >= min_mask_frac).sum(dim=1).max().item() - num_visible
-
-    if scores is None:
-        # one shuffle per sequence, split into visible and predicted
-        keys = torch.rand(batch_size, num_samples, num_patches, device=mask_patches.device)
-        keys = torch.where(in_mask, keys, 2.0)
-        order = keys.argsort(dim=2)[:, :, : num_visible + num_predict]
-        visible_ids, predict_ids = order.split([num_visible, num_predict], dim=2)
-        return visible_ids, predict_ids
-
-    # choose lowest scoring patches as visible, then predict patches uniformly from the rest
-    visible_keys = torch.where(in_mask, scores, torch.inf)
-    visible_ids = visible_keys.topk(num_visible, dim=2, largest=False).indices
-    predict_keys = torch.rand(batch_size, num_samples, num_patches, device=mask_patches.device)
-    predict_keys = torch.where(in_mask, predict_keys, 2.0 + predict_keys)
-    predict_keys = predict_keys.scatter(2, visible_ids, torch.inf)
-    predict_ids = predict_keys.topk(num_predict, dim=2, largest=False).indices
-    return visible_ids, predict_ids
 
 
 # JAX ViT xavier uniform init

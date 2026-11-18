@@ -6,10 +6,12 @@ import nibabel as nib
 import numpy as np
 import pandas as pd
 import torch
+import torch.nn as nn
 import torch.nn.functional as F
 from jaxtyping import Bool, Float
 from torch import Tensor
 from torch.utils.data import Dataset, Sampler
+from torchvision.transforms import v2
 
 
 class Fomo300kDataset(Dataset):
@@ -178,3 +180,216 @@ def normalize_values(
     values = values.clamp(low, high)
     values = (values - values.mean()) / values.std(correction=0).clamp_min(1e-6)
     return values
+
+
+# Transforms, as torch modules like torchvision, composed with torchvision's Compose and
+# RandomApply. Each takes and returns a sample dict: "values" (in-mask intensities), "mask" and
+# "affine" before ToDense, then "image", "mask" and "affine". The functions above and below are
+# the functional api.
+
+
+class NormalizeValues(nn.Module):
+    def __init__(self, clip_quantiles: tuple[float, float] = (0.005, 0.995)):
+        super().__init__()
+        self.clip_quantiles = clip_quantiles
+
+    def forward(self, sample: dict) -> dict:
+        return {**sample, "values": normalize_values(sample["values"], self.clip_quantiles)}
+
+    def extra_repr(self):
+        return f"clip_quantiles={self.clip_quantiles}"
+
+
+class ToDense(nn.Module):
+    def forward(self, sample: dict) -> dict:
+        mask = sample["mask"]
+        image = sample["values"].new_zeros(mask.shape).masked_scatter_(mask, sample["values"])
+        return {"image": image, "mask": mask, "affine": sample["affine"]}
+
+
+class ReorientToRAS(nn.Module):
+    def forward(self, sample: dict) -> dict:
+        image, mask, affine = reorient_to_ras(sample["image"], sample["mask"], sample["affine"])
+        return {"image": image, "mask": mask, "affine": affine}
+
+
+class ResampleToSpacing(nn.Module):
+    def __init__(self, target_spacing: float = 1.0):
+        super().__init__()
+        self.target_spacing = target_spacing
+
+    def forward(self, sample: dict) -> dict:
+        image, mask, affine = resample_to_spacing(
+            sample["image"], sample["mask"], sample["affine"], self.target_spacing
+        )
+        return {"image": image, "mask": mask, "affine": affine}
+
+    def extra_repr(self):
+        return f"target_spacing={self.target_spacing}"
+
+
+class FitToShape(nn.Module):
+    def __init__(self, target_shape: tuple[int, int, int]):
+        super().__init__()
+        self.target_shape = target_shape
+
+    def forward(self, sample: dict) -> dict:
+        image, mask, affine = fit_to_shape(
+            sample["image"], sample["mask"], sample["affine"], self.target_shape
+        )
+        return {"image": image, "mask": mask, "affine": affine}
+
+    def extra_repr(self):
+        return f"target_shape={self.target_shape}"
+
+
+def make_preprocess(
+    clip_quantiles: tuple[float, float], target_spacing: float, grid_size: tuple[int, int, int]
+) -> v2.Compose:
+    # shared by pretraining and eval (ViTEncoder3D.transform_cuda)
+    return v2.Compose(
+        [
+            NormalizeValues(clip_quantiles),
+            ToDense(),
+            ReorientToRAS(),
+            ResampleToSpacing(target_spacing),
+            FitToShape(grid_size),
+        ]
+    )
+
+
+# Photometric augmentation of z-scored images on the training grid. Outside the mask stays zero.
+# Random parameters are drawn on the cpu, so no device syncs. torchvision's intensity transforms
+# assume [0, 1] images and don't keep the mask, so these are our own.
+
+
+def adjust_gamma(
+    image: Float[Tensor, "X Y Z"], mask: Tensor, gamma: float
+) -> Float[Tensor, "X Y Z"]:
+    # gamma on the intensities scaled to [0, 1] over the brain, then back to the original range
+    mask = mask > 0
+    low = torch.where(mask, image, torch.inf).amin()
+    high = torch.where(mask, image, -torch.inf).amax()
+    scaled = ((image - low) / (high - low).clamp_min(1e-6)).clamp(0, 1)
+    image = scaled**gamma * (high - low) + low
+    return image * mask
+
+
+def random_log_bias_field(
+    shape: tuple[int, int, int], strength: float, num_freqs: int = 4, device=None
+) -> Float[Tensor, "X Y Z"]:
+    # smooth random field from a low frequency DCT basis, std = strength
+    coefficients = torch.randn(num_freqs, num_freqs, num_freqs).to(device)
+    coefficients[0, 0, 0] = 0
+    bases = []
+    for size in shape:
+        position = (torch.arange(size, device=device) + 0.5) / size
+        freqs = torch.arange(num_freqs, device=device)
+        bases.append(torch.cos(math.pi * freqs[:, None] * position))
+    log_field = torch.einsum("ijk,ix,jy,kz->xyz", coefficients, *bases)
+    return log_field / log_field.std() * strength
+
+
+def apply_bias_field(
+    image: Float[Tensor, "X Y Z"], mask: Tensor, log_field: Float[Tensor, "X Y Z"]
+) -> Float[Tensor, "X Y Z"]:
+    # multiplicative field on the intensities shifted to start at zero over the brain
+    mask = mask > 0
+    low = torch.where(mask, image, torch.inf).amin()
+    image = (image - low) * log_field.exp() + low
+    return image * mask
+
+
+def scale_shift(
+    image: Float[Tensor, "X Y Z"], mask: Tensor, scale: float, shift: float
+) -> Float[Tensor, "X Y Z"]:
+    return (image * scale + shift) * (mask > 0)
+
+
+def add_noise(image: Float[Tensor, "X Y Z"], mask: Tensor, std: float) -> Float[Tensor, "X Y Z"]:
+    return (image + std * torch.randn_like(image)) * (mask > 0)
+
+
+class RandomGamma(nn.Module):
+    def __init__(self, max_log_gamma: float = 0.3):
+        super().__init__()
+        self.max_log_gamma = max_log_gamma
+
+    def forward(self, sample: dict) -> dict:
+        log_gamma = torch.empty(()).uniform_(-self.max_log_gamma, self.max_log_gamma).item()
+        image = adjust_gamma(sample["image"], sample["mask"], math.exp(log_gamma))
+        return {**sample, "image": image}
+
+    def extra_repr(self):
+        return f"max_log_gamma={self.max_log_gamma}"
+
+
+class RandomBiasField(nn.Module):
+    def __init__(self, strength: float = 0.2, num_freqs: int = 4):
+        super().__init__()
+        self.strength = strength
+        self.num_freqs = num_freqs
+
+    def forward(self, sample: dict) -> dict:
+        image = sample["image"]
+        log_field = random_log_bias_field(
+            tuple(image.shape), self.strength, self.num_freqs, device=image.device
+        )
+        image = apply_bias_field(image, sample["mask"], log_field)
+        return {**sample, "image": image}
+
+    def extra_repr(self):
+        return f"strength={self.strength}, num_freqs={self.num_freqs}"
+
+
+class RandomScaleShift(nn.Module):
+    def __init__(self, max_log_scale: float = 0.2, max_shift: float = 0.2):
+        super().__init__()
+        self.max_log_scale = max_log_scale
+        self.max_shift = max_shift
+
+    def forward(self, sample: dict) -> dict:
+        log_scale = torch.empty(()).uniform_(-self.max_log_scale, self.max_log_scale).item()
+        shift = torch.empty(()).uniform_(-self.max_shift, self.max_shift).item()
+        image = scale_shift(sample["image"], sample["mask"], math.exp(log_scale), shift)
+        return {**sample, "image": image}
+
+    def extra_repr(self):
+        return f"max_log_scale={self.max_log_scale}, max_shift={self.max_shift}"
+
+
+class RandomNoise(nn.Module):
+    def __init__(self, max_std: float = 0.1):
+        super().__init__()
+        self.max_std = max_std
+
+    def forward(self, sample: dict) -> dict:
+        std = torch.empty(()).uniform_(0, self.max_std).item()
+        image = add_noise(sample["image"], sample["mask"], std)
+        return {**sample, "image": image}
+
+    def extra_repr(self):
+        return f"max_std={self.max_std}"
+
+
+AUGMENTATIONS = {
+    "gamma": RandomGamma,
+    "bias_field": RandomBiasField,
+    "scale_shift": RandomScaleShift,
+    "noise": RandomNoise,
+}
+
+
+def make_augment(config: list[dict] | None) -> nn.Module:
+    """Compose from a list of {name, p, **kwargs}, e.g. [{name: gamma, p: 0.5, max_log_gamma: 0.3}]."""
+    transforms = []
+    for entry in config or []:
+        kwargs = dict(entry)
+        name = kwargs.pop("name")
+        p = kwargs.pop("p", 1.0)
+        transform = AUGMENTATIONS[name](**kwargs)
+        if p < 1.0:
+            transform = v2.RandomApply([transform], p=p)
+        transforms.append(transform)
+    # torchvision Compose needs at least one transform
+    return v2.Compose(transforms) if transforms else nn.Identity()

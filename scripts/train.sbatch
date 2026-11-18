@@ -33,7 +33,7 @@ uv run --no-sync python -m nanobrain.train \
     --overrides output_dir=output name="${NAME}" "$@"
 
 # Evaluate the last checkpoint. Finished tasks are skipped when requeued.
-uv run --no-sync python -m brainmarks_smri vit_mae_3d "${TASK_GROUP}" \
+uv run --no-sync python -m brainmarks_smri vit_latent_3d "${TASK_GROUP}" \
     --overrides \
     "imports=[nanobrain.model]" \
     model_kwargs.checkpoint="${RUN_DIR}/checkpoint-last.pth" \

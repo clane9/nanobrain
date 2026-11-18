@@ -18,32 +18,51 @@ grid_size: [192, 240, 192]
 target_spacing: 1.0
 patch_size: 8
 
-# Mask sampling. ~3200 brain mask patches per image on average, so num_visible 512 is a
-# ~0.84 mask ratio.
-num_visible: 512
-num_predict: 1024
-num_samples: 2
-# Samplers:
-#   - uniform: uniform random sampling
-#   - mask_unit: units of mask_unit_size^3 patches (pixio, hiera)
-# null defaults to uniform.
-mask_sampler: null
-mask_unit_size: 2
-
-# Model (ViT-B encoder).
-model_kwargs:
-  depth: 12
-  embed_dim: 768
-  num_heads: 12
-  decoder_depth: 4
-  decoder_embed_dim: 512
-  decoder_num_heads: 8
-  class_tokens: 0
-  drop_path_rate: 0.0
-  # min fraction of in-mask voxels for a patch to be sampled in training
+# Views. ~3200 brain mask patches per image on average. The student encodes num_student
+# tokens, the EMA teacher num_teacher, num_overlap of them shared. The loss covers every teacher
+# token, seen by the student or not. Samplers: random, mask_unit (adds unit_size).
+views:
+  name: random
+  num_student: 512
+  num_teacher: 1536
+  num_overlap: 256
+  # min fraction of in-mask voxels for a patch to be sampled
   min_mask_frac: 0.25
-  # learned_sep, sincos, rope_axial
-  pos_embed: learned_sep
+num_samples: 2
+# loss weight of teacher positions the student also sees (unseen positions weigh 1)
+seen_weight: 1.0
+
+# Photometric augmentation per view, a list of {name, p, **kwargs}. Names: gamma
+# (max_log_gamma), bias_field (strength, num_freqs), scale_shift (max_log_scale, max_shift),
+# noise (max_std). Empty list disables. e.g.
+#   - {name: bias_field, p: 0.5, strength: 0.2}
+student_augment: []
+teacher_augment: []
+
+# Model: jepa (smooth l1 to layer-normed teacher tokens, I-JEPA) or prototype_ce (prototype
+# cross entropy, iBOT / DINOv2 / JEM). prototype_ce also takes head_kwargs (num_prototypes,
+# num_layers, hidden_dim, bottleneck_dim), student_temp, teacher_temp, teacher_balance
+# (softmax, center, sinkhorn), center_momentum, entropy_weight.
+model: jepa
+model_kwargs:
+  # ViT-B
+  encoder_kwargs:
+    depth: 12
+    embed_dim: 768
+    num_heads: 12
+    drop_path_rate: 0.0
+    # learned_sep, sincos, rope_axial
+    pos_embed: learned_sep
+  predictor_kwargs:
+    depth: 4
+    predictor_dim: 512
+    num_heads: 8
+    # self_attn (MAE / I-JEPA) or cross_attn (CAPI)
+    attn_type: self_attn
+
+# EMA teacher momentum, linear from ema_momentum to ema_momentum_end, constant if null.
+ema_momentum: 0.996
+ema_momentum_end: null
 
 # Optimization. batch_size is images per step; each gives num_samples sequences.
 batch_size: 32
@@ -77,13 +96,10 @@ checkpoint_period: 2500
 checkpoint_steps: null
 checkpoint_minutes: null
 
-# Logging.
+# Logging. Teacher feature pca of plot_num_images images every plot_period steps.
 print_freq: 100
 plot_period: 5000
-plot_nrow: 4
-plot_ncol: 2
-# Number of patches to predict for plotting. null predicts all unseen mask patches.
-plot_num_predict: null
+plot_num_images: 4
 
 device: cuda
 seed: 7338
