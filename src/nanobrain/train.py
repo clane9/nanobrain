@@ -98,9 +98,7 @@ def main(args: DictConfig):
     # data pipeline: shared preprocessing, then independent augmentation per view
     patch_grid_size = tuple(size // args.patch_size for size in args.grid_size)
     view_sampler = make_view_sampler(args.views, patch_grid_size)
-    preprocess = make_preprocess(
-        tuple(args.clip_quantiles), args.target_spacing, tuple(args.grid_size)
-    )
+    preprocess = make_preprocess(args.target_spacing, tuple(args.grid_size))
     student_augment = make_augment(args.student_augment)
     teacher_augment = make_augment(args.teacher_augment)
     logger.info(f"view sampler: {view_sampler}")
@@ -111,12 +109,9 @@ def main(args: DictConfig):
     batch_flops = count_batch_flops(args, model, view_sampler, device)
     logger.info(f"flops per batch (teacher fwd, student fwd + bwd): {batch_flops / 1e12:.2f} TFLOP")
 
-    # compile the two steps separately (as capi), the module keeps its state dict keys
-    forward_teacher = model.forward_teacher
-    forward_student = model.forward_student
     if args.compile:
-        forward_teacher = torch.compile(forward_teacher)
-        forward_student = torch.compile(forward_student)
+        # in place compile keeps the state dict keys
+        model.compile()
 
     # optimizer
     # batch size counts sequences, following mae_st which scales by repeated samples
@@ -187,8 +182,6 @@ def main(args: DictConfig):
     stats = train(
         args,
         model,
-        forward_teacher,
-        forward_student,
         train_loader,
         batch_transform,
         optimizer,
@@ -236,8 +229,6 @@ def main(args: DictConfig):
 def train(
     args: DictConfig,
     model: nn.Module,
-    forward_teacher: Callable,
-    forward_student: Callable,
     data_loader: Iterable,
     batch_transform: Callable,
     optimizer: torch.optim.Optimizer,
@@ -311,14 +302,11 @@ def train(
         batch = batch_transform(batch)
 
         with torch.autocast(device_type=device.type, dtype=amp_dtype, enabled=args.amp):
-            targets, teacher_state = forward_teacher(
-                batch["teacher_patches"], batch["teacher_coord"]
-            )
-            loss, student_state = forward_student(
+            loss, state = model(
                 batch["student_patches"],
                 batch["student_coord"],
+                batch["teacher_patches"],
                 batch["teacher_coord"],
-                targets,
                 batch["token_weights"],
             )
 
@@ -337,8 +325,7 @@ def train(
             model.update_teacher(float(momentum_schedule[step]))
 
         # log tensors without syncing, values are only read on log steps
-        monitors = {**teacher_state, **student_state}
-        metric_logger.update(loss=loss_for_log, **monitors)
+        metric_logger.update(loss=loss_for_log, **state)
         if need_update:
             metric_logger.update(lr=lr, grad=grad_norm)
 
@@ -350,7 +337,7 @@ def train(
                 "loss": metric_logger.loss.value,
                 "lr": lr,
                 "grad": metric_logger.grad.value,
-                **{name: metric_logger.meters[name].value for name in monitors},
+                **{name: metric_logger.meters[name].value for name in state},
                 "vol_per_sec": metric_logger.meters["vol/s"].value,
                 "tflop_per_sec": metric_logger.meters["tflop/s"].value,
                 "watts": metric_logger.meters["watts"].value,
@@ -482,9 +469,8 @@ def count_batch_flops(
     flop_counter = FlopCounterMode(display=False)
     with flop_counter:
         with torch.autocast(device_type=device.type, dtype=amp_dtype, enabled=args.amp):
-            targets, _ = model.forward_teacher(teacher_patches, teacher_coord)
-            loss, _ = model.forward_student(
-                student_patches, student_coord, teacher_coord, targets, token_weights
+            loss, _ = model(
+                student_patches, student_coord, teacher_patches, teacher_coord, token_weights
             )
         loss.backward()
     return flop_counter.get_total_flops()
@@ -516,7 +502,7 @@ def plot_features(
             patches = patchify3d(image[None], patch_size)
             in_mask = (patchify3d(mask[None], patch_size) > 0).any(dim=2)[0]
             tokens = encoder(patches[:, in_mask], encoder.coord_grid[:, in_mask])
-            features.append(tokens[0].float())
+            features.append(tokens[0, encoder.class_tokens :].float())
             in_masks.append(in_mask)
 
     # top 3 pcs of the pooled tokens, each scaled to [0, 1] by its 1-99 percentiles

@@ -48,8 +48,7 @@ class PrototypeHead(nn.Module):
 
 
 class PrototypeCELoss(nn.Module):
-    """dinov2 iBOTPatchLoss on one gpu: teacher centering and per-token cross entropy
-    (sinkhorn_knopp below is the other teacher option).
+    """dinov2 iBOTPatchLoss on one gpu: teacher centering or sinkhorn, and per-token cross entropy.
 
     The center update is applied right away, so the teacher probs of a batch use the center
     from the batches before it (as dinov2, which applies the update on the next call).
@@ -74,38 +73,26 @@ class PrototypeCELoss(nn.Module):
         batch_center = teacher_logits.mean(dim=(0, 1), keepdim=True)
         self.center.mul_(self.center_momentum).add_(batch_center, alpha=1 - self.center_momentum)
 
+    @torch.no_grad()
+    def sinkhorn_knopp_teacher(
+        self, teacher_logits: Float[Tensor, "N K"], teacher_temp: float, num_iterations: int = 3
+    ) -> Float[Tensor, "N K"]:
+        teacher_logits = teacher_logits.float()
+        Q = torch.exp((teacher_logits - teacher_logits.max()) / teacher_temp)
+        N, K = Q.shape
+        Q /= Q.sum()
+        for _ in range(num_iterations):
+            # each prototype gets total weight 1 / K, then each token 1 / N
+            Q /= Q.sum(dim=0, keepdim=True) * K
+            Q /= Q.sum(dim=1, keepdim=True) * N
+        # each token's assignment sums to 1
+        return Q * N
+
     def forward(
         self, student_logits: Float[Tensor, "B M K"], teacher_probs: Float[Tensor, "B M K"]
     ) -> Float[Tensor, "B M"]:
         log_probs = F.log_softmax(student_logits.float() / self.student_temp, dim=-1)
         return -torch.sum(teacher_probs * log_probs, dim=-1)
-
-
-# copied from dinov2 iBOTPatchLoss.sinkhorn_knopp_teacher, without the distributed reductions
-@torch.no_grad()
-def sinkhorn_knopp(teacher_output: Tensor, teacher_temp: float, n_iterations: int = 3) -> Tensor:
-    teacher_output = teacher_output.float()
-    # Q is K-by-B for consistency with notations from our paper
-    Q = torch.exp(teacher_output / teacher_temp).t()
-    B = Q.shape[1]  # number of samples to assign
-    K = Q.shape[0]  # how many prototypes
-
-    # make the matrix sums to 1
-    sum_Q = torch.sum(Q)
-    Q /= sum_Q
-
-    for it in range(n_iterations):
-        # normalize each row: total weight per prototype must be 1/K
-        sum_of_rows = torch.sum(Q, dim=1, keepdim=True)
-        Q /= sum_of_rows
-        Q /= K
-
-        # normalize each column: total weight per sample must be 1/B
-        Q /= torch.sum(Q, dim=0, keepdim=True)
-        Q /= B
-
-    Q *= B  # the columns must sum to 1 so that Q is an assignment
-    return Q.t()
 
 
 def entropy_regularizer(logits: Float[Tensor, "B M K"], temp: float) -> Tensor:

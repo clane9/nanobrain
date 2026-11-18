@@ -11,7 +11,7 @@ from torch import Tensor
 from torch.nn.attention import SDPBackend, sdpa_kernel
 
 from .data import crop_to_mask, make_preprocess
-from .losses import PrototypeCELoss, PrototypeHead, entropy_regularizer, sinkhorn_knopp
+from .losses import PrototypeCELoss, PrototypeHead, entropy_regularizer
 from .modules import (
     Block,
     LayerNorm,
@@ -37,8 +37,8 @@ class ViTEncoder3D(nn.Module):
         qkv_bias: bool = True,
         proj_bias: bool = True,
         mlp_ratio: int | float = 4,
+        class_tokens: int = 0,
         drop_path_rate: float = 0.0,
-        clip_quantiles: tuple[float, float] = (0.005, 0.995),
         pos_embed: str = "learned_sep",
     ):
         super().__init__()
@@ -47,7 +47,7 @@ class ViTEncoder3D(nn.Module):
         # tuple for the brainmarks-smri model contract
         self.patch_size = (patch_size, patch_size, patch_size)
         self.embed_dim = embed_dim
-        self.clip_quantiles = clip_quantiles
+        self.class_tokens = class_tokens
         self.pos_embed_type = pos_embed
         patch_grid_size = tuple(size // patch_size for size in grid_size)
 
@@ -66,6 +66,10 @@ class ViTEncoder3D(nn.Module):
         else:
             raise ValueError(f"unknown pos_embed {pos_embed}")
         pos_embed_layer = Rope3D if pos_embed == "rope_axial" else None
+        if class_tokens:
+            self.cls_token = nn.Parameter(torch.empty(1, class_tokens, embed_dim))
+        else:
+            self.cls_token = None
 
         dpr = [x.item() for x in torch.linspace(0, drop_path_rate, depth)]
         self.blocks = nn.ModuleList(
@@ -83,20 +87,32 @@ class ViTEncoder3D(nn.Module):
             ]
         )
         self.norm = LayerNorm(embed_dim)
-        self.preprocess = make_preprocess(clip_quantiles, target_spacing, grid_size)
+        self.preprocess = make_preprocess(target_spacing, grid_size)
         self.apply(_init_weights)
+        if class_tokens:
+            nn.init.normal_(self.cls_token, std=0.02)
 
     def extra_repr(self):
-        return f"{self.grid_size}, {self.patch_size}, pos_embed={self.pos_embed_type}"
+        return (
+            f"{self.grid_size}, {self.patch_size}, class_tokens={self.class_tokens}, "
+            f"pos_embed={self.pos_embed_type}"
+        )
 
     def forward(
         self,
         patches: Float[Tensor, "B N P"],
         coord: Float[Tensor, "B N 3"],
-    ) -> Float[Tensor, "B N D"]:
+    ) -> Float[Tensor, "B R+N D"]:
+        B = patches.shape[0]
         x = self.patch_embed(patches)
         if self.pos_embed is not None:
             x = self.pos_embed(x, coord)
+
+        if self.class_tokens:
+            x = torch.cat([self.cls_token.expand(B, -1, -1), x], dim=1)
+            # class tokens at the center, i.e. not rotated by rope
+            coord = F.pad(coord, (0, 0, self.class_tokens, 0))
+
         for block in self.blocks:
             x = block(x, coord=coord)
         x = self.norm(x)
@@ -105,7 +121,7 @@ class ViTEncoder3D(nn.Module):
     # the methods below implement the brainmarks model contract.
     #   - forward_embeddings: computes a global and dense embedding per input sample
     #   - transform: cpu data transform, runs in loader workers (optional)
-    #   - transform_cuda: cuda data transform. you call it inside forward_embeddings (optional)
+    # cuda preprocessing is optional and should run inside forward_embeddings.
 
     def transform(self, sample: ImageInput) -> dict[str, Tensor]:
         image = torch.from_numpy(sample["image"].get_fdata(dtype=np.float32))
@@ -113,9 +129,6 @@ class ViTEncoder3D(nn.Module):
         affine = sample["image"].affine
         image, mask, affine = crop_to_mask(image, mask, affine)
         return {"values": image[mask], "mask": mask, "affine": affine}
-
-    def transform_cuda(self, sample: dict[str, Tensor]) -> dict:
-        return self.preprocess(sample)
 
     @torch.inference_mode()
     def forward_embeddings(
@@ -132,7 +145,7 @@ class ViTEncoder3D(nn.Module):
                 "mask": sample["mask"].to(device),
                 "affine": sample["affine"],
             }
-            sample = self.transform_cuda(sample)
+            sample = self.preprocess(sample)
             patches = patchify3d(sample["image"][None], self.patch_size[0])
             in_mask = (patchify3d(sample["mask"][None], self.patch_size[0]) > 0).any(dim=2)[0]
             # cudnn attention builds a new graph (~45 ms) for each new sequence length
@@ -140,8 +153,8 @@ class ViTEncoder3D(nn.Module):
                 sdpa_kernel([SDPBackend.FLASH_ATTENTION, SDPBackend.EFFICIENT_ATTENTION]),
                 torch.autocast(device.type, dtype=torch.bfloat16, enabled=device.type == "cuda"),
             ):
-                tokens = self(patches[:, in_mask], self.coord_grid[:, in_mask])
-            tokens = tokens[0].float()
+                tokens = self.forward(patches[:, in_mask], self.coord_grid[:, in_mask])
+            tokens = tokens[0, self.class_tokens :].float()
 
             output = EmbeddingOutput(
                 global_embedding=tokens.mean(dim=0),
@@ -225,25 +238,27 @@ class Predictor3D(nn.Module):
 
     def forward(
         self,
+        coord: Float[Tensor, "B M 3"],
         context: Float[Tensor, "B N D"],
         context_coord: Float[Tensor, "B N 3"],
-        query_coord: Float[Tensor, "B M 3"],
     ) -> Float[Tensor, "B M O"]:
-        B, M, _ = query_coord.shape
-        queries = self.mask_token.expand(B, M, -1)
+        B, M, _ = coord.shape
+        mask_tokens = self.mask_token.expand(B, M, -1)
         if self.pos_embed is not None:
-            queries = self.pos_embed(queries, query_coord)
+            mask_tokens = self.pos_embed(mask_tokens, coord)
 
         if self.attn_type == "self_attn":
-            x = torch.cat([self.proj(context), queries], dim=1)
-            coord = torch.cat([context_coord, query_coord], dim=1)
-            for block in self.blocks:
-                x = block(x, coord=coord)
-            x = x[:, -M:]
+            x = torch.cat([self.proj(context), mask_tokens], dim=1)
+            coord = torch.cat([context_coord, coord], dim=1)
+            context = context_coord = None
         else:
-            x = queries
-            for block in self.blocks:
-                x = block(x, context=context, coord=query_coord, context_coord=context_coord)
+            x = mask_tokens
+
+        for block in self.blocks:
+            x = block(x, coord=coord, context=context, context_coord=context_coord)
+
+        if self.attn_type == "self_attn":
+            x = x[:, -M:]
 
         x = self.norm(x)
         x = self.head(x)
@@ -251,9 +266,10 @@ class Predictor3D(nn.Module):
 
 
 # Latent prediction models. Each has a student (encoder, predictor, optional head) and an EMA
-# teacher (encoder, optional head), with forward_teacher and forward_student called separately
-# from the training loop (as capi do_teacher / do_student). Token weights let the loss weight
-# student-visible and unseen positions differently.
+# teacher (encoder, optional head). forward runs forward_teacher for the targets, then the
+# student, and returns (loss, state). Token weights let the loss weight student-visible and unseen
+# positions differently. The encoder outputs class tokens first; the predictor sees them as
+# context, the targets are patch tokens only.
 
 
 class JEPA3D(nn.Module):
@@ -264,7 +280,6 @@ class JEPA3D(nn.Module):
         grid_size: tuple[int, int, int] = (192, 240, 192),
         target_spacing: float = 1.0,
         patch_size: int = 8,
-        clip_quantiles: tuple[float, float] = (0.005, 0.995),
         encoder_kwargs: dict | None = None,
         predictor_kwargs: dict | None = None,
     ):
@@ -273,7 +288,6 @@ class JEPA3D(nn.Module):
             grid_size=grid_size,
             target_spacing=target_spacing,
             patch_size=patch_size,
-            clip_quantiles=clip_quantiles,
             **(encoder_kwargs or {}),
         )
         embed_dim = self.encoder.embed_dim
@@ -306,24 +320,31 @@ class JEPA3D(nn.Module):
         self, patches: Float[Tensor, "B M P"], coord: Float[Tensor, "B M 3"]
     ) -> tuple[Float[Tensor, "B M D"], dict[str, Tensor]]:
         tokens = self.teacher_encoder(patches, coord)
+        tokens = tokens[:, self.teacher_encoder.class_tokens :]
         targets = F.layer_norm(tokens, (tokens.shape[-1],))
         # collapse monitor: feature std across tokens, before the layer norm
         state = {"teacher_std": tokens.float().std(dim=(0, 1)).mean()}
         return targets, state
 
-    def forward_student(
+    def forward(
         self,
-        patches: Float[Tensor, "B N P"],
-        coord: Float[Tensor, "B N 3"],
-        target_coord: Float[Tensor, "B M 3"],
-        targets: Float[Tensor, "B M D"],
+        student_patches: Float[Tensor, "B N P"],
+        student_coord: Float[Tensor, "B N 3"],
+        teacher_patches: Float[Tensor, "B M P"],
+        teacher_coord: Float[Tensor, "B M 3"],
         token_weights: Float[Tensor, "B M"],
     ) -> tuple[Tensor, dict[str, Tensor]]:
-        tokens = self.encoder(patches, coord)
-        pred = self.predictor(tokens, coord, target_coord)
+        targets, state = self.forward_teacher(teacher_patches, teacher_coord)
+
+        tokens = self.encoder(student_patches, student_coord)
+        # class tokens sit at the center, as in the encoder
+        context_coord = F.pad(student_coord, (0, 0, self.encoder.class_tokens, 0))
+        pred = self.predictor(teacher_coord, tokens, context_coord)
         loss = F.smooth_l1_loss(pred.float(), targets.float(), reduction="none").mean(dim=-1)
         loss = (loss * token_weights).sum() / token_weights.sum()
-        state = {"student_std": tokens.detach().float().std(dim=(0, 1)).mean()}
+
+        patch_tokens = tokens[:, self.encoder.class_tokens :].detach().float()
+        state["student_std"] = patch_tokens.std(dim=(0, 1)).mean()
         return loss, state
 
 
@@ -339,7 +360,6 @@ class PrototypeCE3D(nn.Module):
         grid_size: tuple[int, int, int] = (192, 240, 192),
         target_spacing: float = 1.0,
         patch_size: int = 8,
-        clip_quantiles: tuple[float, float] = (0.005, 0.995),
         encoder_kwargs: dict | None = None,
         predictor_kwargs: dict | None = None,
         head_kwargs: dict | None = None,
@@ -359,7 +379,6 @@ class PrototypeCE3D(nn.Module):
             grid_size=grid_size,
             target_spacing=target_spacing,
             patch_size=patch_size,
-            clip_quantiles=clip_quantiles,
             **(encoder_kwargs or {}),
         )
         embed_dim = self.encoder.embed_dim
@@ -400,6 +419,7 @@ class PrototypeCE3D(nn.Module):
         self, patches: Float[Tensor, "B M P"], coord: Float[Tensor, "B M 3"]
     ) -> tuple[Float[Tensor, "B M K"], dict[str, Tensor]]:
         tokens = self.teacher_encoder(patches, coord)
+        tokens = tokens[:, self.teacher_encoder.class_tokens :]
         logits = self.teacher_head(tokens).float()
         if self.teacher_balance == "softmax":
             probs = F.softmax(logits / self.teacher_temp, dim=-1)
@@ -407,7 +427,7 @@ class PrototypeCE3D(nn.Module):
             probs = self.loss.softmax_center_teacher(logits, self.teacher_temp)
             self.loss.update_center(logits)
         else:
-            probs = sinkhorn_knopp(logits.flatten(0, 1), self.teacher_temp)
+            probs = self.loss.sinkhorn_knopp_teacher(logits.flatten(0, 1), self.teacher_temp)
             probs = probs.unflatten(0, logits.shape[:2])
 
         # collapse monitors: entropy of the mean teacher distribution, and of single tokens
@@ -419,20 +439,26 @@ class PrototypeCE3D(nn.Module):
         }
         return probs, state
 
-    def forward_student(
+    def forward(
         self,
-        patches: Float[Tensor, "B N P"],
-        coord: Float[Tensor, "B N 3"],
-        target_coord: Float[Tensor, "B M 3"],
-        targets: Float[Tensor, "B M K"],
+        student_patches: Float[Tensor, "B N P"],
+        student_coord: Float[Tensor, "B N 3"],
+        teacher_patches: Float[Tensor, "B M P"],
+        teacher_coord: Float[Tensor, "B M 3"],
         token_weights: Float[Tensor, "B M"],
     ) -> tuple[Tensor, dict[str, Tensor]]:
-        tokens = self.encoder(patches, coord)
-        pred = self.predictor(tokens, coord, target_coord)
+        targets, state = self.forward_teacher(teacher_patches, teacher_coord)
+
+        tokens = self.encoder(student_patches, student_coord)
+        # class tokens sit at the center, as in the encoder
+        context_coord = F.pad(student_coord, (0, 0, self.encoder.class_tokens, 0))
+        pred = self.predictor(teacher_coord, tokens, context_coord)
         logits = self.head(pred)
         loss = self.loss(logits, targets)
         loss = (loss * token_weights).sum() / token_weights.sum()
-        state = {"student_std": tokens.detach().float().std(dim=(0, 1)).mean()}
+
+        patch_tokens = tokens[:, self.encoder.class_tokens :].detach().float()
+        state["student_std"] = patch_tokens.std(dim=(0, 1)).mean()
         if self.entropy_weight:
             entropy_loss = entropy_regularizer(logits, self.loss.student_temp)
             loss = loss + self.entropy_weight * entropy_loss
@@ -448,7 +474,6 @@ def build_model(args: dict) -> nn.Module:
     return model_class(
         grid_size=tuple(args["grid_size"]),
         target_spacing=args["target_spacing"],
-        clip_quantiles=tuple(args["clip_quantiles"]),
         patch_size=args["patch_size"],
         **args["model_kwargs"],
     )
@@ -464,7 +489,6 @@ def vit_latent_3d(
     model = ViTEncoder3D(
         grid_size=tuple(args["grid_size"]),
         target_spacing=args["target_spacing"],
-        clip_quantiles=tuple(args["clip_quantiles"]),
         patch_size=args["patch_size"],
         **args["model_kwargs"].get("encoder_kwargs", {}),
     )

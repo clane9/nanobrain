@@ -11,7 +11,6 @@ output_dir: output
 train_filelist: src/nanobrain/config/fomo300k_images.txt
 num_workers: 8
 prefetch_factor: 2
-clip_quantiles: [0.005, 0.995]
 
 # Fixed 1mm grid that all images are fit to.
 grid_size: [192, 240, 192]
@@ -50,6 +49,7 @@ model_kwargs:
     depth: 12
     embed_dim: 768
     num_heads: 12
+    class_tokens: 0
     drop_path_rate: 0.0
     # learned_sep, sincos, rope_axial
     pos_embed: learned_sep

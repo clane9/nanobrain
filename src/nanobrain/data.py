@@ -189,15 +189,8 @@ def normalize_values(
 
 
 class NormalizeValues(nn.Module):
-    def __init__(self, clip_quantiles: tuple[float, float] = (0.005, 0.995)):
-        super().__init__()
-        self.clip_quantiles = clip_quantiles
-
     def forward(self, sample: dict) -> dict:
-        return {**sample, "values": normalize_values(sample["values"], self.clip_quantiles)}
-
-    def extra_repr(self):
-        return f"clip_quantiles={self.clip_quantiles}"
+        return {**sample, "values": normalize_values(sample["values"])}
 
 
 class ToDense(nn.Module):
@@ -243,13 +236,10 @@ class FitToShape(nn.Module):
         return f"target_shape={self.target_shape}"
 
 
-def make_preprocess(
-    clip_quantiles: tuple[float, float], target_spacing: float, grid_size: tuple[int, int, int]
-) -> v2.Compose:
-    # shared by pretraining and eval (ViTEncoder3D.transform_cuda)
+def make_preprocess(target_spacing: float, grid_size: tuple[int, int, int]) -> v2.Compose:
     return v2.Compose(
         [
-            NormalizeValues(clip_quantiles),
+            NormalizeValues(),
             ToDense(),
             ReorientToRAS(),
             ResampleToSpacing(target_spacing),
