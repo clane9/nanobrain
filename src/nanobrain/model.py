@@ -10,7 +10,13 @@ from jaxtyping import Float, Int
 from torch import Tensor
 from torch.nn.attention import SDPBackend, sdpa_kernel
 
-from .data import crop_to_mask, make_preprocess
+from .data import (
+    crop_to_mask,
+    fit_to_shape,
+    normalize_values,
+    reorient_to_ras,
+    resample_to_spacing,
+)
 from .losses import PrototypeCELoss, PrototypeHead, entropy_regularizer
 from .modules import (
     Block,
@@ -87,7 +93,6 @@ class ViTEncoder3D(nn.Module):
             ]
         )
         self.norm = LayerNorm(embed_dim)
-        self.preprocess = make_preprocess(target_spacing, grid_size)
         self.apply(_init_weights)
         if class_tokens:
             nn.init.normal_(self.cls_token, std=0.02)
@@ -121,7 +126,7 @@ class ViTEncoder3D(nn.Module):
     # the methods below implement the brainmarks model contract.
     #   - forward_embeddings: computes a global and dense embedding per input sample
     #   - transform: cpu data transform, runs in loader workers (optional)
-    # cuda preprocessing is optional and should run inside forward_embeddings.
+    #   - transform_cuda: cuda data transform. you call it inside forward_embeddings (optional)
 
     def transform(self, sample: ImageInput) -> dict[str, Tensor]:
         image = torch.from_numpy(sample["image"].get_fdata(dtype=np.float32))
@@ -129,6 +134,17 @@ class ViTEncoder3D(nn.Module):
         affine = sample["image"].affine
         image, mask, affine = crop_to_mask(image, mask, affine)
         return {"values": image[mask], "mask": mask, "affine": affine}
+
+    def transform_cuda(self, sample: dict[str, Tensor]) -> dict:
+        values = sample["values"]
+        mask = sample["mask"]
+        affine = sample["affine"]
+        values = normalize_values(values)
+        image = values.new_zeros(mask.shape).masked_scatter_(mask, values)
+        image, mask, affine = reorient_to_ras(image, mask, affine)
+        image, mask, affine = resample_to_spacing(image, mask, affine, self.target_spacing)
+        image, mask, affine = fit_to_shape(image, mask, affine, self.grid_size)
+        return {"image": image, "mask": mask, "affine": affine}
 
     @torch.inference_mode()
     def forward_embeddings(
@@ -145,7 +161,7 @@ class ViTEncoder3D(nn.Module):
                 "mask": sample["mask"].to(device),
                 "affine": sample["affine"],
             }
-            sample = self.preprocess(sample)
+            sample = self.transform_cuda(sample)
             patches = patchify3d(sample["image"][None], self.patch_size[0])
             in_mask = (patchify3d(sample["mask"][None], self.patch_size[0]) > 0).any(dim=2)[0]
             # cudnn attention builds a new graph (~45 ms) for each new sequence length

@@ -25,8 +25,11 @@ from nanobrain.data import (
     Fomo300kDataset,
     InfiniteSampler,
     brle_to_dense,
+    fit_to_shape,
     make_augment,
-    make_preprocess,
+    normalize_values,
+    reorient_to_ras,
+    resample_to_spacing,
 )
 from nanobrain.masking import make_view_sampler
 from nanobrain.model import build_model, patchify3d, select_tokens
@@ -95,14 +98,12 @@ def main(args: DictConfig):
     num_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     logger.info(f"num params: {num_params / 1e6:.1f}M")
 
-    # data pipeline: shared preprocessing, then independent augmentation per view
+    # data pipeline: preprocessing, then independent augmentation per view
     patch_grid_size = tuple(size // args.patch_size for size in args.grid_size)
     view_sampler = make_view_sampler(args.views, patch_grid_size)
-    preprocess = make_preprocess(args.target_spacing, tuple(args.grid_size))
     student_augment = make_augment(args.student_augment)
     teacher_augment = make_augment(args.teacher_augment)
     logger.info(f"view sampler: {view_sampler}")
-    logger.info(f"preprocess: {preprocess}")
     logger.info(f"student augment: {student_augment}")
     logger.info(f"teacher augment: {teacher_augment}")
 
@@ -172,7 +173,7 @@ def main(args: DictConfig):
         worker_init_fn=ignore_sigterm,
     )
     batch_transform = make_batch_transform(
-        args, model.encoder.coord_grid, view_sampler, preprocess, student_augment, teacher_augment
+        args, model.encoder.coord_grid, view_sampler, student_augment, teacher_augment
     )
 
     # on SIGTERM (e.g. preemption) finish the current step, save and exit. resumes when relaunched
@@ -401,7 +402,6 @@ def make_batch_transform(
     args: DictConfig,
     coord_grid: Tensor,
     view_sampler: Callable,
-    preprocess: nn.Module,
     student_augment: nn.Module,
     teacher_augment: nn.Module,
 ):
@@ -411,12 +411,9 @@ def make_batch_transform(
     def fn(batch: list[dict[str, Tensor]]) -> dict[str, Tensor]:
         images, student_images, teacher_images, masks = [], [], [], []
         for sample in batch:
-            sample = {
-                "values": sample["values"].float() * sample["scale"],
-                "mask": brle_to_dense(sample["mask_rle"], shape=sample["shape"]),
-                "affine": sample["affine"],
-            }
-            sample = preprocess(sample)
+            sample = sample_transform(
+                sample, target_spacing=args.target_spacing, grid_size=tuple(args.grid_size)
+            )
             images.append(sample["image"])
             masks.append(sample["mask"])
             student_images.append(student_augment(sample)["image"])
@@ -448,6 +445,23 @@ def make_batch_transform(
         }
 
     return fn
+
+
+def sample_transform(
+    sample: dict[str, Tensor],
+    *,
+    target_spacing: float = 1.0,
+    grid_size: tuple[int, int, int] = (192, 240, 192),
+) -> dict[str, Tensor]:
+    # pretraining preprocessing, on gpu. eval preprocessing is ViTEncoder3D.transform_cuda, keep in sync
+    values = sample["values"].float() * sample["scale"]
+    values = normalize_values(values)
+    mask = brle_to_dense(sample["mask_rle"], shape=sample["shape"])
+    image = values.new_zeros(mask.shape).masked_scatter_(mask, values)
+    image, mask, affine = reorient_to_ras(image, mask, sample["affine"])
+    image, mask, affine = resample_to_spacing(image, mask, affine, target_spacing)
+    image, mask, affine = fit_to_shape(image, mask, affine, grid_size)
+    return {"image": image, "mask": mask, "affine": affine}
 
 
 def count_batch_flops(

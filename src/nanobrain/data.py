@@ -182,74 +182,10 @@ def normalize_values(
     return values
 
 
-# Transforms, as torch modules like torchvision, composed with torchvision's Compose and
-# RandomApply. Each takes and returns a sample dict: "values" (in-mask intensities), "mask" and
-# "affine" before ToDense, then "image", "mask" and "affine". The functions above and below are
-# the functional api.
-
-
-class NormalizeValues(nn.Module):
-    def forward(self, sample: dict) -> dict:
-        return {**sample, "values": normalize_values(sample["values"])}
-
-
-class ToDense(nn.Module):
-    def forward(self, sample: dict) -> dict:
-        mask = sample["mask"]
-        image = sample["values"].new_zeros(mask.shape).masked_scatter_(mask, sample["values"])
-        return {"image": image, "mask": mask, "affine": sample["affine"]}
-
-
-class ReorientToRAS(nn.Module):
-    def forward(self, sample: dict) -> dict:
-        image, mask, affine = reorient_to_ras(sample["image"], sample["mask"], sample["affine"])
-        return {"image": image, "mask": mask, "affine": affine}
-
-
-class ResampleToSpacing(nn.Module):
-    def __init__(self, target_spacing: float = 1.0):
-        super().__init__()
-        self.target_spacing = target_spacing
-
-    def forward(self, sample: dict) -> dict:
-        image, mask, affine = resample_to_spacing(
-            sample["image"], sample["mask"], sample["affine"], self.target_spacing
-        )
-        return {"image": image, "mask": mask, "affine": affine}
-
-    def extra_repr(self):
-        return f"target_spacing={self.target_spacing}"
-
-
-class FitToShape(nn.Module):
-    def __init__(self, target_shape: tuple[int, int, int]):
-        super().__init__()
-        self.target_shape = target_shape
-
-    def forward(self, sample: dict) -> dict:
-        image, mask, affine = fit_to_shape(
-            sample["image"], sample["mask"], sample["affine"], self.target_shape
-        )
-        return {"image": image, "mask": mask, "affine": affine}
-
-    def extra_repr(self):
-        return f"target_shape={self.target_shape}"
-
-
-def make_preprocess(target_spacing: float, grid_size: tuple[int, int, int]) -> v2.Compose:
-    return v2.Compose(
-        [
-            NormalizeValues(),
-            ToDense(),
-            ReorientToRAS(),
-            ResampleToSpacing(target_spacing),
-            FitToShape(grid_size),
-        ]
-    )
-
-
-# Photometric augmentation of z-scored images on the training grid. Outside the mask stays zero.
-# Random parameters are drawn on the cpu, so no device syncs. torchvision's intensity transforms
+# Photometric augmentation of z-scored images on the training grid, as torch modules (composed
+# with torchvision's Compose and RandomApply) over the functions below. Each module takes and
+# returns a sample dict with "image" and "mask". Outside the mask stays zero. Random parameters are
+# drawn on the cpu, so no device syncs. torchvision's intensity transforms
 # assume [0, 1] images and don't keep the mask, so these are our own.
 
 
