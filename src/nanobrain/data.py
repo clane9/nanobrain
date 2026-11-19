@@ -13,39 +13,70 @@ from torch.utils.data import Dataset, Sampler
 
 
 class Fomo300kDataset(Dataset):
-    def __init__(self, root: str | Path, filelist: str | Path):
+    def __init__(
+        self,
+        root: str | Path,
+        filelist: str | Path,
+        partners: str | Path | None = None,
+        seed: int = 0,
+    ):
         self.root = Path(root)
         self.paths = Path(filelist).read_text().split()
+        self.seed = seed
+
+        # partner paths per image, empty for images without a partner
+        self.partners = [[] for _ in self.paths]
+        if partners is not None:
+            table = pd.read_parquet(partners)
+            groups = table.groupby("path")["partner"].agg(list)
+            self.partners = [groups.get(path, []) for path in self.paths]
+
+        all_paths = set(self.paths)
+        for group in self.partners:
+            all_paths.update(group)
         members = pd.read_parquet(
             self.root / "tables" / "shards.parquet", columns=["path", "shard", "offset", "size"]
         )
-        members = members.set_index("path").loc[self.paths]
-        self.shards = members["shard"].tolist()
-        self.offsets = members["offset"].to_numpy()
-        self.sizes = members["size"].to_numpy()
+        self.members = members[members["path"].isin(all_paths)].set_index("path")
+        assert len(self.members) == len(all_paths), "missing shard members"
 
     def __len__(self) -> int:
         return len(self.paths)
 
-    def __getitem__(self, index: int) -> dict:
+    def __getitem__(self, key: tuple[int, int]) -> dict:
+        # key is (image index, draw count) from InfiniteSampler. the draw seeds the partner choice
+        index, draw = key
+        sample = self.read(self.paths[index])
+        partners = self.partners[index]
+        if partners:
+            rng = np.random.default_rng((self.seed, draw))
+            sample["partner"] = self.read(partners[rng.integers(len(partners))])
+        return sample
+
+    def read(self, path: str) -> dict:
         # npz members are stored uncompressed, so read them straight from their offset
-        with open(self.root / self.shards[index], "rb") as shard:
-            shard.seek(self.offsets[index])
-            data = shard.read(self.sizes[index])
+        member = self.members.loc[path]
+        with open(self.root / member["shard"], "rb") as shard:
+            shard.seek(member["offset"])
+            data = shard.read(member["size"])
         with np.load(io.BytesIO(data)) as npz:
             sample = {
-                "path": self.paths[index],
+                "path": path,
                 "values": torch.from_numpy(npz["values"]),
                 "scale": float(npz["scale"]),
                 "mask_rle": torch.from_numpy(npz["mask_rle"]),
                 "shape": tuple(npz["shape"].tolist()),
                 "affine": npz["affine"],
+                "mni_affine": npz["mni_affine"],
             }
         return sample
 
 
-class InfiniteSampler(Sampler[int]):
-    """Endless shuffled passes over the dataset, starting from sample index `start`."""
+class InfiniteSampler(Sampler[tuple[int, int]]):
+    """Endless shuffled passes over the dataset, starting from draw `start`.
+
+    Yields (sample index, draw count).
+    """
 
     def __init__(self, num_samples: int, seed: int = 0, start: int = 0):
         self.num_samples = num_samples
@@ -58,7 +89,7 @@ class InfiniteSampler(Sampler[int]):
         while True:
             for sample_index in torch.randperm(self.num_samples, generator=generator).tolist():
                 if index >= self.start:
-                    yield sample_index
+                    yield sample_index, index
                 index += 1
 
 
@@ -163,6 +194,33 @@ def fit_to_shape(
     shift = np.eye(4)
     shift[:3, 3] = -np.array(befores)
     return F.pad(image, pad), F.pad(mask, pad), affine @ shift
+
+
+def resample_affine(
+    image: Float[Tensor, "X Y Z"],
+    mask: Float[Tensor, "X Y Z"],
+    voxel_map: np.ndarray,
+    shape: tuple[int, int, int],
+) -> tuple[Tensor, Tensor]:
+    # trilinear resample onto a new grid. voxel_map takes new grid voxels to input voxels
+    # grid_sample takes coords (x, y, z) = (k, j, i) scaled to [-1, 1] (align_corners)
+    to_grid_coords = []
+    for grid_shape in [image.shape, shape]:
+        matrix = np.zeros((4, 4))
+        for axis, size in enumerate(grid_shape):
+            matrix[2 - axis, axis] = 2 / (size - 1)
+            matrix[2 - axis, 3] = -1
+        matrix[3, 3] = 1
+        to_grid_coords.append(matrix)
+    input_to_grid, output_to_grid = to_grid_coords
+    theta = input_to_grid @ voxel_map @ np.linalg.inv(output_to_grid)
+    theta = torch.from_numpy(theta[:3]).float().to(image.device, non_blocking=True)
+
+    grid = F.affine_grid(theta[None], [1, 1, *shape], align_corners=True)
+    image = F.grid_sample(image[None, None], grid, mode="bilinear", align_corners=True)[0, 0]
+    mask = F.grid_sample(mask[None, None].float(), grid, mode="bilinear", align_corners=True)
+    mask = (mask[0, 0] > 0.5).float()
+    return image * mask, mask
 
 
 def normalize_values(
