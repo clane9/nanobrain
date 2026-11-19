@@ -216,16 +216,9 @@ def resample_affine(
     theta = input_to_grid @ voxel_map @ np.linalg.inv(output_to_grid)
     theta = torch.from_numpy(theta[:3]).float().to(image.device, non_blocking=True)
 
-    # same grid as F.affine_grid, which is ~10x slower (a bmm with inner dim 4)
-    i, j, k = [torch.linspace(-1, 1, size, device=image.device) for size in shape]
-    grid = (
-        k[None, None, :, None] * theta[:, 0]
-        + j[None, :, None, None] * theta[:, 1]
-        + i[:, None, None, None] * theta[:, 2]
-        + theta[:, 3]
-    )
+    grid = F.affine_grid(theta[None], [1, 2, *shape], align_corners=True)
     channels = torch.stack([image, mask.float()])
-    channels = F.grid_sample(channels[None], grid[None], mode="bilinear", align_corners=True)[0]
+    channels = F.grid_sample(channels[None], grid, mode="bilinear", align_corners=True)[0]
     mask = (channels[1] > 0.5).float()
     return channels[0] * mask, mask
 
