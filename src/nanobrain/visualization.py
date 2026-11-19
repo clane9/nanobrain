@@ -18,29 +18,23 @@ def plot_mask_pred(
     visible_mask: np.ndarray,
     pred_mask: np.ndarray,
     img_mask: np.ndarray,
+    partner_images: np.ndarray,
+    partner_mask: np.ndarray,
+    partner_visible_mask: np.ndarray | None = None,
     view: Literal["sag", "cor", "ax"] = "ax",
     nrow: int = 4,
     ncol: int = 2,
     vmin: float = -3.0,
     vmax: float = 3.0,
-    partner_images: np.ndarray | None = None,
-    partner_mask: np.ndarray | None = None,
-    partner_visible_mask: np.ndarray | None = None,
 ) -> Figure:
-    # all volumes shape [B, X, Y, Z]. pred is of partner_images when given, else of images
+    # all volumes shape [B, X, Y, Z]. pred is of partner_images (B = A for plain MAE).
+    # partner_visible_mask adds a panel of the visible partner patches
     visible_mask = visible_mask > 0
     img_mask = img_mask > 0
     pred_mask = pred_mask > 0
+    partner_mask = partner_mask > 0
     visible_mask = visible_mask & img_mask
-    pred_mask = pred_mask & img_mask
-    show_partner = partner_images is not None
-    if show_partner:
-        partner_mask = partner_mask > 0
-        partner_visible_mask = (partner_visible_mask > 0) & partner_mask
-        pred_mask = pred_mask & partner_mask
-    else:
-        partner_images = images
-        partner_mask = img_mask
+    pred_mask = pred_mask & img_mask & partner_mask
 
     # center slice, oriented with superior/anterior up
     axis = VIEW_AXES[view] + 1
@@ -63,8 +57,8 @@ def plot_mask_pred(
     pred_panel = np.where(partner_mask, pred_panel, background)
     image_panel = np.where(partner_mask, partner_images, background)
     panels = [visible_panel, pred_panel, image_panel]
-    if show_partner:
-        partner_visible_mask = np.take(partner_visible_mask, index, axis=axis)
+    if partner_visible_mask is not None:
+        partner_visible_mask = np.take(partner_visible_mask > 0, index, axis=axis) & partner_mask
         partner_visible_panel = np.where(partner_visible_mask, partner_images, masked)
         partner_visible_panel = np.where(partner_mask, partner_visible_panel, background)
         panels.insert(1, partner_visible_panel)

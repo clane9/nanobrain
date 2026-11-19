@@ -48,7 +48,8 @@ model_kwargs:
   min_mask_frac: 0.25
   # learned_sep, sincos, rope_axial
   pos_embed: learned_sep
-  # visible partner B patches given to the decoder (own patch embed), outside the predicted
+  # visible partner B patches given to the decoder (own patch embed), drawn from B's mask
+  # outside the predicted positions
   num_partner_visible: 0
 
 # Optimization. batch_size is images per step; each gives num_samples sequences.

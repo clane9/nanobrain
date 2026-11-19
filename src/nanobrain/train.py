@@ -98,6 +98,9 @@ def main(args: DictConfig):
 
     batch_flops = count_batch_flops(args, model, device)
     logger.info(f"flops per batch (fwd + bwd): {batch_flops / 1e12:.2f} TFLOP")
+    # peak memory of the training steps, not the eager flop count pass
+    if device.type == "cuda":
+        torch.cuda.reset_peak_memory_stats(device)
 
     if args.compile:
         # in place compile keeps the state dict keys
@@ -293,12 +296,12 @@ def train(
             loss, state = model(
                 images,
                 masks,
+                batch["partner_image"],
+                batch["partner_mask"],
                 num_visible=args.num_visible,
                 num_predict=args.num_predict,
                 num_samples=args.num_samples,
                 scores=scores,
-                partner_images=batch["partner_image"],
-                partner_mask=batch["partner_mask"],
                 is_cross=batch["is_cross"],
             )
 
@@ -411,11 +414,12 @@ def make_batch_transform(args: DictConfig):
         else:
             raise ValueError(f"unknown mask_sampler {args.mask_sampler}")
 
-        # partner B on the grid of A, B = A for images without a partner
-        partner_images = None
-        partner_masks = None
-        is_cross = None
-        if args.partners is not None:
+        # partner B on the grid of A. B = A without partners, and for images without a partner
+        if args.partners is None:
+            partner_images = images
+            partner_masks = masks
+            is_cross = torch.zeros(len(batch), dtype=torch.bool, device=images.device)
+        else:
             partners = []
             for sample, transformed in zip(batch, samples):
                 if "partner" in sample:
@@ -492,7 +496,10 @@ def count_batch_flops(args: DictConfig, model: nn.Module, device: torch.device) 
     flop_counter = FlopCounterMode(display=False)
     with flop_counter:
         with torch.autocast(device_type=device.type, dtype=amp_dtype, enabled=args.amp):
+            # plain MAE (B = A) flops, the few partner visible tokens included
             loss, _ = model(
+                images,
+                masks,
                 images,
                 masks,
                 num_visible=args.num_visible,
@@ -515,14 +522,11 @@ def plot_examples(
     num_examples = args.plot_nrow * args.plot_ncol
     images = batch["image"][:num_examples]
     masks = batch["mask"][:num_examples]
+    partner_images = batch["partner_image"][:num_examples]
+    partner_masks = batch["partner_mask"][:num_examples]
     scores = batch["scores"]
     if scores is not None:
         scores = scores[:num_examples, :1]
-    partner_images = batch["partner_image"]
-    partner_masks = batch["partner_mask"]
-    if partner_images is not None:
-        partner_images = partner_images[:num_examples]
-        partner_masks = partner_masks[:num_examples]
 
     model.eval()
     # eager, the plot shapes differ from training and compiling them isn't worth it
@@ -534,13 +538,13 @@ def plot_examples(
         _, state = model(
             images,
             masks,
+            partner_images,
+            partner_masks,
             num_visible=args.num_visible,
             num_predict=args.plot_num_predict,
             num_samples=1,
             with_patches=True,
             scores=scores,
-            partner_images=partner_images,
-            partner_mask=partner_masks,
         )
     model.train()
 
@@ -548,7 +552,6 @@ def plot_examples(
     patch_size = args.patch_size
     vis_ids = state["vis_ids"]
     target_ids = state["target_ids"]
-    partner_vis_ids = state["partner_vis_ids"]
     pred = patches_to_volume(state["pred_patches"].float(), target_ids, grid_size, patch_size)
     visible_mask = patches_to_volume(
         torch.ones_like(state["vis_patches"]), vis_ids, grid_size, patch_size
@@ -556,24 +559,24 @@ def plot_examples(
     pred_mask = patches_to_volume(
         torch.ones_like(state["target_patches"]), target_ids, grid_size, patch_size
     )
-    partner_visible_mask = patches_to_volume(
-        torch.ones_like(state["partner_vis_patches"]), partner_vis_ids, grid_size, patch_size
-    )
-
-    # partner panels whenever the decoder sees or predicts a partner B (B = A without partners)
-    show_partner = partner_images is not None or model.num_partner_visible > 0
-    if partner_images is None:
-        partner_images = images
-        partner_masks = masks
+    # partner visible panel only when the decoder sees partner patches
+    partner_visible_mask = None
+    if model.num_partner_visible:
+        partner_visible_mask = patches_to_volume(
+            torch.ones_like(state["partner_vis_patches"]),
+            state["partner_vis_ids"],
+            grid_size,
+            patch_size,
+        )
+        partner_visible_mask = partner_visible_mask.cpu().numpy()
 
     images = images.float().cpu().numpy()
     masks = masks.cpu().numpy()
+    partner_images = partner_images.float().cpu().numpy()
+    partner_masks = partner_masks.cpu().numpy()
     pred = pred.cpu().numpy()
     visible_mask = visible_mask.cpu().numpy()
     pred_mask = pred_mask.cpu().numpy()
-    partner_images = partner_images.float().cpu().numpy()
-    partner_masks = partner_masks.cpu().numpy()
-    partner_visible_mask = partner_visible_mask.cpu().numpy()
 
     plot_dir = Path(args.output_dir) / "plots"
     plot_paths = {}
@@ -584,12 +587,12 @@ def plot_examples(
             visible_mask,
             pred_mask=pred_mask,
             img_mask=masks,
+            partner_images=partner_images,
+            partner_mask=partner_masks,
+            partner_visible_mask=partner_visible_mask,
             view=view,
             nrow=args.plot_nrow,
             ncol=args.plot_ncol,
-            partner_images=partner_images if show_partner else None,
-            partner_mask=partner_masks,
-            partner_visible_mask=partner_visible_mask,
         )
         path = plot_dir / f"mae_{view}_{step:07d}.png"
         fig.savefig(path)

@@ -225,28 +225,24 @@ class ViTMAE3D(nn.Module):
         self,
         images: Float[Tensor, "B X Y Z"],
         mask: Float[Tensor, "B X Y Z"],
+        partner_images: Float[Tensor, "B X Y Z"],
+        partner_mask: Float[Tensor, "B X Y Z"],
         num_visible: int,
         num_predict: int | None = None,
         num_samples: int = 1,
         with_patches: bool = False,
         scores: Float[Tensor, "B S N"] | None = None,
-        partner_images: Float[Tensor, "B X Y Z"] | None = None,
-        partner_mask: Float[Tensor, "B X Y Z"] | None = None,
         is_cross: Bool[Tensor, " B"] | None = None,
     ) -> tuple[Tensor, dict[str, Tensor]]:
-        # encode masked images A, predict partner images B (B = A when not given) at positions
-        # masked in A, given a few visible B patches. is_cross flags B != A, for logging
+        # encode masked images A, predict partner images B at positions masked in A, given a few
+        # visible B patches. B = A for plain MAE. is_cross flags B != A, for logging
         B = images.shape[0]
         assert tuple(images.shape[1:]) == tuple(self.grid_size)
 
         patches = patchify3d(images, self.patch_size[0])
         mask_patches = patchify3d(mask, self.patch_size[0])
-        if partner_images is None:
-            partner_patches = patches
-            partner_mask_patches = mask_patches
-        else:
-            partner_patches = patchify3d(partner_images, self.patch_size[0])
-            partner_mask_patches = patchify3d(partner_mask, self.patch_size[0])
+        partner_patches = patchify3d(partner_images, self.patch_size[0])
+        partner_mask_patches = patchify3d(partner_mask, self.patch_size[0])
         coord = self.coord_grid.expand(B, -1, -1)
 
         # sample num_samples sequences per image, then flatten them into the batch
@@ -448,9 +444,8 @@ def sample_sequences(
     scores: Tensor | None = None,
     min_mask_frac: float = 0.25,
 ) -> tuple[Tensor, Tensor, Tensor]:
-    # visible from the mask, predicted from the rest inside both masks first, partner visible
-    # from the partner mask outside the predicted
     batch_size, num_patches, _ = mask_patches.shape
+    device = mask_patches.device
     mask_frac = mask_patches.mean(dim=2)
     in_mask = mask_frac[:, None, :] >= min_mask_frac
     in_both = (mask_patches * partner_mask_patches).mean(dim=2)[:, None, :] >= min_mask_frac
@@ -459,29 +454,20 @@ def sample_sequences(
         # one host sync to get the longest mask sequence in the batch
         num_predict = (mask_frac >= min_mask_frac).sum(dim=1).max().item() - num_visible
 
+    # lowest scoring mask patches are visible, uniform random without scores
     if scores is None:
-        # one shuffle per sequence, split into visible and the rest
-        keys = torch.rand(batch_size, num_samples, num_patches, device=mask_patches.device)
-        keys = torch.where(in_mask, keys, 2.0)
-        order = keys.argsort(dim=2)
-        visible_ids = order[:, :, :num_visible]
-        rest_ids = order[:, :, num_visible:]
-        # stable sort keeps the shuffle within patches in and out of both masks
-        rest_outside = ~in_both.expand(-1, num_samples, -1).gather(2, rest_ids)
-        rest_ids = rest_ids.gather(2, rest_outside.byte().argsort(dim=2, stable=True))
-        predict_ids = rest_ids[:, :, :num_predict]
-    else:
-        # choose lowest scoring patches as visible, then predict patches uniformly from the rest
-        visible_keys = torch.where(in_mask, scores, torch.inf)
-        visible_ids = visible_keys.topk(num_visible, dim=2, largest=False).indices
-        predict_keys = torch.rand(batch_size, num_samples, num_patches, device=mask_patches.device)
-        predict_keys = torch.where(in_both, predict_keys, 2.0 + predict_keys)
-        predict_keys = predict_keys.scatter(2, visible_ids, torch.inf)
-        predict_ids = predict_keys.topk(num_predict, dim=2, largest=False).indices
+        scores = torch.rand(batch_size, num_samples, num_patches, device=device)
+    visible_keys = torch.where(in_mask, scores, torch.inf)
+    visible_ids = visible_keys.topk(num_visible, dim=2, largest=False).indices
 
-    if not num_partner_visible:
-        return visible_ids, predict_ids, predict_ids[:, :, :0]
-    partner_keys = torch.rand(batch_size, num_samples, num_patches, device=mask_patches.device)
+    # predict uniformly from the rest, patches inside both masks first
+    predict_keys = torch.rand(batch_size, num_samples, num_patches, device=device)
+    predict_keys = torch.where(in_both, predict_keys, 2.0 + predict_keys)
+    predict_keys = predict_keys.scatter(2, visible_ids, torch.inf)
+    predict_ids = predict_keys.topk(num_predict, dim=2, largest=False).indices
+
+    # partner visible uniformly from the partner mask, outside the predicted
+    partner_keys = torch.rand(batch_size, num_samples, num_patches, device=device)
     partner_keys = torch.where(in_partner, partner_keys, 2.0 + partner_keys)
     partner_keys = partner_keys.scatter(2, predict_ids, torch.inf)
     partner_visible_ids = partner_keys.topk(num_partner_visible, dim=2, largest=False).indices
