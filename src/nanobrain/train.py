@@ -27,6 +27,7 @@ from nanobrain.data import (
     fit_to_shape,
     normalize_values,
     reorient_to_ras,
+    resample_affine,
     resample_to_spacing,
 )
 from nanobrain.masking import mask_unit_scores
@@ -141,7 +142,9 @@ def main(args: DictConfig):
     start_step, prev_wall_time = misc.load_model(args, model, optimizer, loss_scaler)
 
     # data loader. one endless pass over shuffled epochs, resumed at the next unseen image
-    dataset = Fomo300kDataset(DATA_ROOT / "fomo300k", args.train_filelist)
+    dataset = Fomo300kDataset(
+        DATA_ROOT / "fomo300k", args.train_filelist, partners=args.partners, seed=args.seed
+    )
     logger.info(f"train dataset: {len(dataset)} images")
     sampler = InfiniteSampler(
         len(dataset), seed=args.seed, start=start_step * args.accum_iter * args.batch_size
@@ -287,14 +290,16 @@ def train(
         scores = batch["scores"]
 
         with torch.autocast(device_type=device.type, dtype=amp_dtype, enabled=args.amp):
-            loss = model(
+            loss, state = model(
                 images,
                 masks,
                 num_visible=args.num_visible,
                 num_predict=args.num_predict,
                 num_samples=args.num_samples,
-                with_state=False,
                 scores=scores,
+                partner_images=batch["partner_image"],
+                partner_mask=batch["partner_mask"],
+                is_cross=batch["is_cross"],
             )
 
         loss_for_log = loss.detach()
@@ -309,7 +314,7 @@ def train(
         )
 
         # log tensors without syncing, values are only read on log steps
-        metric_logger.update(loss=loss_for_log)
+        metric_logger.update(loss=loss_for_log, **state)
         if need_update:
             metric_logger.update(lr=lr, grad=grad_norm)
 
@@ -321,6 +326,7 @@ def train(
                 "loss": metric_logger.loss.value,
                 "lr": lr,
                 "grad": metric_logger.grad.value,
+                **{name: metric_logger.meters[name].value for name in state},
                 "vol_per_sec": metric_logger.meters["vol/s"].value,
                 "tflop_per_sec": metric_logger.meters["tflop/s"].value,
                 "watts": metric_logger.meters["watts"].value,
@@ -342,7 +348,7 @@ def train(
         # not on stop by signal, just save and exit
         is_plot_step = args.plot_period and (step % args.plot_period == 0 or done)
         if num_examples and is_plot_step:
-            plot_paths = plot_examples(args, model, images, masks, scores, step, amp_dtype, device)
+            plot_paths = plot_examples(args, model, batch, step, amp_dtype, device)
             if args.wandb:
                 wandb.log(
                     {f"train/{name}": wandb.Image(str(path)) for name, path in plot_paths.items()},
@@ -386,7 +392,7 @@ def make_lr_schedule(
 
 def make_batch_transform(args: DictConfig):
     def fn(batch: list[dict[str, Tensor]]) -> dict[str, Tensor]:
-        batch = [
+        samples = [
             sample_transform(
                 sample,
                 target_spacing=args.target_spacing,
@@ -395,8 +401,8 @@ def make_batch_transform(args: DictConfig):
             )
             for sample in batch
         ]
-        images = torch.stack([sample["image"] for sample in batch])
-        masks = torch.stack([sample["mask"] for sample in batch])
+        images = torch.stack([sample["image"] for sample in samples])
+        masks = torch.stack([sample["mask"] for sample in samples])
 
         if args.mask_sampler is None or args.mask_sampler == "uniform":
             scores = None
@@ -404,7 +410,38 @@ def make_batch_transform(args: DictConfig):
             scores = mask_unit_scores(masks, args.num_samples, args.patch_size, args.mask_unit_size)
         else:
             raise ValueError(f"unknown mask_sampler {args.mask_sampler}")
-        return {"image": images, "mask": masks, "scores": scores}
+
+        # partner B on the grid of A, B = A for images without a partner
+        partner_images = None
+        partner_masks = None
+        is_cross = None
+        if args.partners is not None:
+            partners = []
+            for sample, transformed in zip(batch, samples):
+                if "partner" in sample:
+                    partner = partner_transform(
+                        sample["partner"],
+                        transformed["affine"],
+                        sample["mni_affine"],
+                        grid_size=tuple(args.grid_size),
+                        clip_quantiles=tuple(args.clip_quantiles),
+                    )
+                else:
+                    partner = transformed
+                partners.append(partner)
+            partner_images = torch.stack([partner["image"] for partner in partners])
+            partner_masks = torch.stack([partner["mask"] for partner in partners])
+            is_cross = torch.tensor(["partner" in sample for sample in batch])
+            is_cross = is_cross.to(images.device, non_blocking=True)
+
+        return {
+            "image": images,
+            "mask": masks,
+            "scores": scores,
+            "partner_image": partner_images,
+            "partner_mask": partner_masks,
+            "is_cross": is_cross,
+        }
 
     return fn
 
@@ -427,6 +464,26 @@ def sample_transform(
     return {"image": image, "mask": mask, "affine": affine}
 
 
+def partner_transform(
+    partner: dict[str, Tensor],
+    affine: np.ndarray,
+    mni_affine: np.ndarray,
+    *,
+    grid_size: tuple[int, int, int] = (192, 240, 192),
+    clip_quantiles: tuple[float, float] = (0.005, 0.995),
+) -> dict[str, Tensor]:
+    # partner image B straight from its stored grid onto the final grid (affine) of image A
+    values = partner["values"].float() * partner["scale"]
+    values = normalize_values(values, clip_quantiles)
+    mask = brle_to_dense(partner["mask_rle"], shape=partner["shape"])
+    image = values.new_zeros(mask.shape).masked_scatter_(mask, values)
+    # A voxels -> A world -> MNI -> B world -> B voxels. MNI aligns sessions, scanner worlds don't
+    world_to_partner_world = np.linalg.inv(partner["mni_affine"]) @ mni_affine
+    voxel_map = np.linalg.inv(partner["affine"]) @ world_to_partner_world @ affine
+    image, mask = resample_affine(image, mask, voxel_map, grid_size)
+    return {"image": image, "mask": mask}
+
+
 def count_batch_flops(args: DictConfig, model: nn.Module, device: torch.device) -> float:
     # fwd + bwd flops of one training batch, on dummy images where every patch is in the mask
     amp_dtype = getattr(torch, args.amp_dtype)
@@ -435,13 +492,12 @@ def count_batch_flops(args: DictConfig, model: nn.Module, device: torch.device) 
     flop_counter = FlopCounterMode(display=False)
     with flop_counter:
         with torch.autocast(device_type=device.type, dtype=amp_dtype, enabled=args.amp):
-            loss = model(
+            loss, _ = model(
                 images,
                 masks,
                 num_visible=args.num_visible,
                 num_predict=args.num_predict,
                 num_samples=args.num_samples,
-                with_state=False,
             )
         loss.backward()
     model.zero_grad(set_to_none=True)
@@ -451,18 +507,22 @@ def count_batch_flops(args: DictConfig, model: nn.Module, device: torch.device) 
 def plot_examples(
     args: DictConfig,
     model: nn.Module,
-    images: Tensor,
-    masks: Tensor,
-    scores: Tensor | None,
+    batch: dict[str, Tensor],
     step: int,
     amp_dtype: torch.dtype,
     device: torch.device,
 ) -> dict[str, Path]:
     num_examples = args.plot_nrow * args.plot_ncol
-    images = images[:num_examples]
-    masks = masks[:num_examples]
+    images = batch["image"][:num_examples]
+    masks = batch["mask"][:num_examples]
+    scores = batch["scores"]
     if scores is not None:
         scores = scores[:num_examples, :1]
+    partner_images = batch["partner_image"]
+    partner_masks = batch["partner_mask"]
+    if partner_images is not None:
+        partner_images = partner_images[:num_examples]
+        partner_masks = partner_masks[:num_examples]
 
     model.eval()
     # eager, the plot shapes differ from training and compiling them isn't worth it
@@ -477,7 +537,10 @@ def plot_examples(
             num_visible=args.num_visible,
             num_predict=args.plot_num_predict,
             num_samples=1,
+            with_patches=True,
             scores=scores,
+            partner_images=partner_images,
+            partner_mask=partner_masks,
         )
     model.train()
 
@@ -485,6 +548,7 @@ def plot_examples(
     patch_size = args.patch_size
     vis_ids = state["vis_ids"]
     target_ids = state["target_ids"]
+    partner_vis_ids = state["partner_vis_ids"]
     pred = patches_to_volume(state["pred_patches"].float(), target_ids, grid_size, patch_size)
     visible_mask = patches_to_volume(
         torch.ones_like(state["vis_patches"]), vis_ids, grid_size, patch_size
@@ -492,12 +556,24 @@ def plot_examples(
     pred_mask = patches_to_volume(
         torch.ones_like(state["target_patches"]), target_ids, grid_size, patch_size
     )
+    partner_visible_mask = patches_to_volume(
+        torch.ones_like(state["partner_vis_patches"]), partner_vis_ids, grid_size, patch_size
+    )
+
+    # partner panels whenever the decoder sees or predicts a partner B (B = A without partners)
+    show_partner = partner_images is not None or model.num_partner_visible > 0
+    if partner_images is None:
+        partner_images = images
+        partner_masks = masks
 
     images = images.float().cpu().numpy()
     masks = masks.cpu().numpy()
     pred = pred.cpu().numpy()
     visible_mask = visible_mask.cpu().numpy()
     pred_mask = pred_mask.cpu().numpy()
+    partner_images = partner_images.float().cpu().numpy()
+    partner_masks = partner_masks.cpu().numpy()
+    partner_visible_mask = partner_visible_mask.cpu().numpy()
 
     plot_dir = Path(args.output_dir) / "plots"
     plot_paths = {}
@@ -511,6 +587,9 @@ def plot_examples(
             view=view,
             nrow=args.plot_nrow,
             ncol=args.plot_ncol,
+            partner_images=partner_images if show_partner else None,
+            partner_mask=partner_masks,
+            partner_visible_mask=partner_visible_mask,
         )
         path = plot_dir / f"mae_{view}_{step:07d}.png"
         fig.savefig(path)

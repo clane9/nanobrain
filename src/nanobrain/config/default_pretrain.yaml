@@ -12,6 +12,10 @@ train_filelist: src/nanobrain/config/fomo300k_images.txt
 num_workers: 8
 prefetch_factor: 2
 clip_quantiles: [0.005, 0.995]
+# Cross-view. Parquet of (path, partner) pairs, e.g. src/nanobrain/config/fomo300k_partners.parquet
+# (same subject, any session). The decoder predicts a random partner B of image A at positions
+# masked in A. B = A for images without a partner, and for all images when null.
+partners: null
 
 # Fixed 1mm grid that all images are fit to.
 grid_size: [192, 240, 192]
@@ -44,6 +48,8 @@ model_kwargs:
   min_mask_frac: 0.25
   # learned_sep, sincos, rope_axial
   pos_embed: learned_sep
+  # visible partner B patches given to the decoder (own patch embed), outside the predicted
+  num_partner_visible: 0
 
 # Optimization. batch_size is images per step; each gives num_samples sequences.
 batch_size: 32

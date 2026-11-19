@@ -23,13 +23,24 @@ def plot_mask_pred(
     ncol: int = 2,
     vmin: float = -3.0,
     vmax: float = 3.0,
+    partner_images: np.ndarray | None = None,
+    partner_mask: np.ndarray | None = None,
+    partner_visible_mask: np.ndarray | None = None,
 ) -> Figure:
-    # all volumes shape [B, X, Y, Z]
+    # all volumes shape [B, X, Y, Z]. pred is of partner_images when given, else of images
     visible_mask = visible_mask > 0
     img_mask = img_mask > 0
     pred_mask = pred_mask > 0
     visible_mask = visible_mask & img_mask
     pred_mask = pred_mask & img_mask
+    show_partner = partner_images is not None
+    if show_partner:
+        partner_mask = partner_mask > 0
+        partner_visible_mask = (partner_visible_mask > 0) & partner_mask
+        pred_mask = pred_mask & partner_mask
+    else:
+        partner_images = images
+        partner_mask = img_mask
 
     # center slice, oriented with superior/anterior up
     axis = VIEW_AXES[view] + 1
@@ -39,6 +50,8 @@ def plot_mask_pred(
     visible_mask = np.take(visible_mask, index, axis=axis)
     pred_mask = np.take(pred_mask, index, axis=axis)
     img_mask = np.take(img_mask, index, axis=axis)
+    partner_images = np.take(partner_images, index, axis=axis)
+    partner_mask = np.take(partner_mask, index, axis=axis)
 
     # gray levels as a fraction of the display range
     background = vmin + BACKGROUND_GRAY * (vmax - vmin)
@@ -46,20 +59,27 @@ def plot_mask_pred(
 
     visible_panel = np.where(visible_mask, images, masked)
     visible_panel = np.where(img_mask, visible_panel, background)
-    pred_panel = np.where(pred_mask, pred, images)
-    pred_panel = np.where(img_mask, pred_panel, background)
-    image_panel = np.where(img_mask, images, background)
+    pred_panel = np.where(pred_mask, pred, partner_images)
+    pred_panel = np.where(partner_mask, pred_panel, background)
+    image_panel = np.where(partner_mask, partner_images, background)
+    panels = [visible_panel, pred_panel, image_panel]
+    if show_partner:
+        partner_visible_mask = np.take(partner_visible_mask, index, axis=axis)
+        partner_visible_panel = np.where(partner_visible_mask, partner_images, masked)
+        partner_visible_panel = np.where(partner_mask, partner_visible_panel, background)
+        panels.insert(1, partner_visible_panel)
 
     height, width = images.shape[1:]
     size = max(height, width)
     num_examples = min(len(images), nrow * ncol)
+    num_panels = len(panels)
 
     # roughly one pixel per voxel
     dpi = 100
     fig, axes = plt.subplots(
         nrow,
         ncol,
-        figsize=(1.05 * ncol * 3 * size / dpi, 1.05 * nrow * size / dpi),
+        figsize=(1.05 * ncol * num_panels * size / dpi, 1.05 * nrow * size / dpi),
         dpi=dpi,
         squeeze=False,
     )
@@ -70,9 +90,9 @@ def plot_mask_pred(
         if ii >= num_examples:
             continue
 
-        # three panels padded to square and stacked with no gap.
-        strip = np.full((size, 3 * size), background, dtype=np.float32)
-        for jj, panel in enumerate([visible_panel, pred_panel, image_panel]):
+        # panels padded to square and stacked with no gap.
+        strip = np.full((size, num_panels * size), background, dtype=np.float32)
+        for jj, panel in enumerate(panels):
             plane = np.flipud(panel[ii].T)
             plane_height, plane_width = plane.shape
             top = (size - plane_height) // 2

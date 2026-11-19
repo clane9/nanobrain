@@ -6,7 +6,7 @@ from brainmarks_smri.models import EmbeddingOutput, ImageInput, register_model
 from einops import rearrange
 from torch import Tensor
 from torch.nn.attention import SDPBackend, sdpa_kernel
-from jaxtyping import Float, Int
+from jaxtyping import Bool, Float, Int
 
 from .modules import (
     Block,
@@ -46,6 +46,7 @@ class ViTMAE3D(nn.Module):
         clip_quantiles: tuple[float, float] = (0.005, 0.995),
         min_mask_frac: float = 0.25,
         pos_embed: str = "learned_sep",
+        num_partner_visible: int = 0,
     ):
         super().__init__()
         self.grid_size = grid_size
@@ -58,6 +59,7 @@ class ViTMAE3D(nn.Module):
         self.clip_quantiles = clip_quantiles
         self.min_mask_frac = min_mask_frac
         self.pos_embed_type = pos_embed
+        self.num_partner_visible = num_partner_visible
 
         patch_dim = patch_size**3
         # patch center coords in mm, relative to the volume center
@@ -102,6 +104,11 @@ class ViTMAE3D(nn.Module):
 
         # decoder
         self.decoder_proj = nn.Linear(embed_dim, decoder_embed_dim)
+        # visible partner patches enter the decoder through their own patch embedding
+        if num_partner_visible:
+            self.partner_patch_embed = nn.Linear(patch_dim, decoder_embed_dim)
+        else:
+            self.partner_patch_embed = None
         if pos_embed == "learned_sep":
             self.decoder_pos_embed = SeparablePosEmbed3D(
                 patch_grid_size, decoder_embed_dim, unit=unit
@@ -143,7 +150,7 @@ class ViTMAE3D(nn.Module):
     def extra_repr(self):
         return (
             f"{self.grid_size}, {self.patch_size}, class_tokens={self.class_tokens}, "
-            f"pos_embed={self.pos_embed_type}"
+            f"pos_embed={self.pos_embed_type}, num_partner_visible={self.num_partner_visible}"
         )
 
     def init_weights(self):
@@ -181,6 +188,8 @@ class ViTMAE3D(nn.Module):
         embeds: Float[Tensor, "B R+N D"],
         coord: Float[Tensor, "B N 3"],
         target_coord: Float[Tensor, "B M 3"],
+        partner_patches: Float[Tensor, "B K P"],
+        partner_coord: Float[Tensor, "B K 3"],
     ) -> Float[Tensor, "B M P"]:
         B = embeds.shape[0]
         M = target_coord.shape[1]
@@ -192,8 +201,15 @@ class ViTMAE3D(nn.Module):
         if self.decoder_pos_embed is not None:
             mask_tokens = self.decoder_pos_embed(mask_tokens, target_coord)
 
-        x = torch.cat([embeds, mask_tokens], dim=1)
-        coord = torch.cat([coord, target_coord], dim=1)
+        if self.num_partner_visible:
+            partner_tokens = self.partner_patch_embed(partner_patches)
+            if self.decoder_pos_embed is not None:
+                partner_tokens = self.decoder_pos_embed(partner_tokens, partner_coord)
+            x = torch.cat([embeds, partner_tokens, mask_tokens], dim=1)
+            coord = torch.cat([coord, partner_coord, target_coord], dim=1)
+        else:
+            x = torch.cat([embeds, mask_tokens], dim=1)
+            coord = torch.cat([coord, target_coord], dim=1)
         if self.class_tokens:
             coord = F.pad(coord, (0, 0, self.class_tokens, 0))
 
@@ -212,61 +228,85 @@ class ViTMAE3D(nn.Module):
         num_visible: int,
         num_predict: int | None = None,
         num_samples: int = 1,
-        with_state: bool = True,
+        with_patches: bool = False,
         scores: Float[Tensor, "B S N"] | None = None,
-    ):
+        partner_images: Float[Tensor, "B X Y Z"] | None = None,
+        partner_mask: Float[Tensor, "B X Y Z"] | None = None,
+        is_cross: Bool[Tensor, " B"] | None = None,
+    ) -> tuple[Tensor, dict[str, Tensor]]:
+        # encode masked images A, predict partner images B (B = A when not given) at positions
+        # masked in A, given a few visible B patches. is_cross flags B != A, for logging
         B = images.shape[0]
         assert tuple(images.shape[1:]) == tuple(self.grid_size)
 
         patches = patchify3d(images, self.patch_size[0])
         mask_patches = patchify3d(mask, self.patch_size[0])
+        if partner_images is None:
+            partner_patches = patches
+            partner_mask_patches = mask_patches
+        else:
+            partner_patches = patchify3d(partner_images, self.patch_size[0])
+            partner_mask_patches = patchify3d(partner_mask, self.patch_size[0])
         coord = self.coord_grid.expand(B, -1, -1)
 
         # sample num_samples sequences per image, then flatten them into the batch
-        visible_ids, predict_ids = sample_sequences(
+        visible_ids, predict_ids, partner_visible_ids = sample_sequences(
             mask_patches,
+            partner_mask_patches,
             num_visible,
             num_predict,
+            self.num_partner_visible,
             num_samples,
             scores,
             min_mask_frac=self.min_mask_frac,
         )
-        order = torch.cat([visible_ids, predict_ids], dim=2)
-        num_predict = predict_ids.shape[2]
         batch_ids = torch.arange(B, device=images.device)[:, None, None]
-        patches = patches[batch_ids, order].flatten(0, 1)
-        mask_patches = mask_patches[batch_ids, order].flatten(0, 1)
-        coord = coord[batch_ids, order].flatten(0, 1)
-
-        vis_patches, target_patches = torch.split(patches, [num_visible, num_predict], dim=1)
-        vis_mask_patches, target_mask_patches = torch.split(
-            mask_patches, [num_visible, num_predict], dim=1
-        )
-        vis_coord, target_coord = torch.split(coord, [num_visible, num_predict], dim=1)
+        vis_patches = patches[batch_ids, visible_ids].flatten(0, 1)
+        vis_coord = coord[batch_ids, visible_ids].flatten(0, 1)
+        target_patches = partner_patches[batch_ids, predict_ids].flatten(0, 1)
+        target_coord = coord[batch_ids, predict_ids].flatten(0, 1)
+        target_mask_patches = mask_patches[batch_ids, predict_ids].flatten(0, 1)
+        partner_target_mask_patches = partner_mask_patches[batch_ids, predict_ids].flatten(0, 1)
+        partner_vis_patches = partner_patches[batch_ids, partner_visible_ids].flatten(0, 1)
+        partner_vis_coord = coord[batch_ids, partner_visible_ids].flatten(0, 1)
 
         embeds = self.forward_encoder(vis_patches, vis_coord)
-        pred_patches = self.forward_decoder(embeds, vis_coord, target_coord)
-        loss = F.mse_loss(pred_patches, target_patches, reduction="none")
-        loss = (target_mask_patches * loss).sum() / target_mask_patches.sum()
+        pred_patches = self.forward_decoder(
+            embeds, vis_coord, target_coord, partner_vis_patches, partner_vis_coord
+        )
+        # loss inside both brain masks
+        loss_weight = target_mask_patches * partner_target_mask_patches
+        error = F.mse_loss(pred_patches, target_patches, reduction="none")
+        loss = (loss_weight * error).sum() / loss_weight.sum()
 
-        if not with_state:
-            return loss
+        state = {}
+        if is_cross is not None:
+            # loss split over cross-view (B != A) and self (B = A) sequences
+            seq_is_cross = is_cross.repeat_interleave(num_samples)[:, None, None]
+            error = error.detach()
+            cross_weight = loss_weight * seq_is_cross
+            self_weight = loss_weight * ~seq_is_cross
+            state["cross_frac"] = is_cross.float().mean()
+            state["loss_cross"] = (cross_weight * error).sum() / cross_weight.sum().clamp_min(1)
+            state["loss_self"] = (self_weight * error).sum() / self_weight.sum().clamp_min(1)
 
-        patch_ids = order.flatten(0, 1)
-        image_ids = torch.arange(B, device=images.device).repeat_interleave(num_samples)
-        vis_ids, target_ids = torch.split(patch_ids, [num_visible, num_predict], dim=1)
-
-        state = {
-            "vis_patches": vis_patches,
-            "target_patches": target_patches,
-            "vis_mask_patches": vis_mask_patches,
-            "target_mask_patches": target_mask_patches,
-            "embeds": embeds,
-            "pred_patches": pred_patches,
-            "vis_ids": vis_ids,
-            "target_ids": target_ids,
-            "image_ids": image_ids,
-        }
+        if with_patches:
+            state.update(
+                {
+                    "vis_patches": vis_patches,
+                    "target_patches": target_patches,
+                    "loss_weight": loss_weight,
+                    "partner_vis_patches": partner_vis_patches,
+                    "embeds": embeds,
+                    "pred_patches": pred_patches,
+                    "vis_ids": visible_ids.flatten(0, 1),
+                    "target_ids": predict_ids.flatten(0, 1),
+                    "partner_vis_ids": partner_visible_ids.flatten(0, 1),
+                    "image_ids": torch.arange(B, device=images.device).repeat_interleave(
+                        num_samples
+                    ),
+                }
+            )
         return loss, state
 
     # the methods below implement the brainmarks model contract.
@@ -400,35 +440,52 @@ def make_coord_grid(
 
 def sample_sequences(
     mask_patches: Tensor,
+    partner_mask_patches: Tensor,
     num_visible: int,
     num_predict: int | None,
+    num_partner_visible: int = 0,
     num_samples: int = 1,
     scores: Tensor | None = None,
     min_mask_frac: float = 0.25,
-) -> tuple[Tensor, Tensor]:
+) -> tuple[Tensor, Tensor, Tensor]:
+    # visible from the mask, predicted from the rest inside both masks first, partner visible
+    # from the partner mask outside the predicted
     batch_size, num_patches, _ = mask_patches.shape
     mask_frac = mask_patches.mean(dim=2)
     in_mask = mask_frac[:, None, :] >= min_mask_frac
+    in_both = (mask_patches * partner_mask_patches).mean(dim=2)[:, None, :] >= min_mask_frac
+    in_partner = partner_mask_patches.mean(dim=2)[:, None, :] >= min_mask_frac
     if num_predict is None:
         # one host sync to get the longest mask sequence in the batch
         num_predict = (mask_frac >= min_mask_frac).sum(dim=1).max().item() - num_visible
 
     if scores is None:
-        # one shuffle per sequence, split into visible and predicted
+        # one shuffle per sequence, split into visible and the rest
         keys = torch.rand(batch_size, num_samples, num_patches, device=mask_patches.device)
         keys = torch.where(in_mask, keys, 2.0)
-        order = keys.argsort(dim=2)[:, :, : num_visible + num_predict]
-        visible_ids, predict_ids = order.split([num_visible, num_predict], dim=2)
-        return visible_ids, predict_ids
+        order = keys.argsort(dim=2)
+        visible_ids = order[:, :, :num_visible]
+        rest_ids = order[:, :, num_visible:]
+        # stable sort keeps the shuffle within patches in and out of both masks
+        rest_outside = ~in_both.expand(-1, num_samples, -1).gather(2, rest_ids)
+        rest_ids = rest_ids.gather(2, rest_outside.byte().argsort(dim=2, stable=True))
+        predict_ids = rest_ids[:, :, :num_predict]
+    else:
+        # choose lowest scoring patches as visible, then predict patches uniformly from the rest
+        visible_keys = torch.where(in_mask, scores, torch.inf)
+        visible_ids = visible_keys.topk(num_visible, dim=2, largest=False).indices
+        predict_keys = torch.rand(batch_size, num_samples, num_patches, device=mask_patches.device)
+        predict_keys = torch.where(in_both, predict_keys, 2.0 + predict_keys)
+        predict_keys = predict_keys.scatter(2, visible_ids, torch.inf)
+        predict_ids = predict_keys.topk(num_predict, dim=2, largest=False).indices
 
-    # choose lowest scoring patches as visible, then predict patches uniformly from the rest
-    visible_keys = torch.where(in_mask, scores, torch.inf)
-    visible_ids = visible_keys.topk(num_visible, dim=2, largest=False).indices
-    predict_keys = torch.rand(batch_size, num_samples, num_patches, device=mask_patches.device)
-    predict_keys = torch.where(in_mask, predict_keys, 2.0 + predict_keys)
-    predict_keys = predict_keys.scatter(2, visible_ids, torch.inf)
-    predict_ids = predict_keys.topk(num_predict, dim=2, largest=False).indices
-    return visible_ids, predict_ids
+    if not num_partner_visible:
+        return visible_ids, predict_ids, predict_ids[:, :, :0]
+    partner_keys = torch.rand(batch_size, num_samples, num_patches, device=mask_patches.device)
+    partner_keys = torch.where(in_partner, partner_keys, 2.0 + partner_keys)
+    partner_keys = partner_keys.scatter(2, predict_ids, torch.inf)
+    partner_visible_ids = partner_keys.topk(num_partner_visible, dim=2, largest=False).indices
+    return visible_ids, predict_ids, partner_visible_ids
 
 
 # JAX ViT xavier uniform init
