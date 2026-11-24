@@ -47,6 +47,7 @@ class ViTMAE3D(nn.Module):
         min_mask_frac: float = 0.25,
         pos_embed: str = "learned_sep",
         num_partner_visible: int = 0,
+        predict_both: bool = False,
     ):
         super().__init__()
         self.grid_size = grid_size
@@ -60,6 +61,7 @@ class ViTMAE3D(nn.Module):
         self.min_mask_frac = min_mask_frac
         self.pos_embed_type = pos_embed
         self.num_partner_visible = num_partner_visible
+        self.predict_both = predict_both
 
         patch_dim = patch_size**3
         # patch center coords in mm, relative to the volume center
@@ -134,7 +136,9 @@ class ViTMAE3D(nn.Module):
         )
 
         self.decoder_norm = LayerNorm(decoder_embed_dim)
-        self.decoder_head = nn.Linear(decoder_embed_dim, patch_dim)
+        # predict_both: A's patch and B's patch per predicted position
+        num_targets = 2 if predict_both else 1
+        self.decoder_head = nn.Linear(decoder_embed_dim, num_targets * patch_dim)
         self.init_weights()
 
     @classmethod
@@ -150,7 +154,8 @@ class ViTMAE3D(nn.Module):
     def extra_repr(self):
         return (
             f"{self.grid_size}, {self.patch_size}, class_tokens={self.class_tokens}, "
-            f"pos_embed={self.pos_embed_type}, num_partner_visible={self.num_partner_visible}"
+            f"pos_embed={self.pos_embed_type}, num_partner_visible={self.num_partner_visible}, "
+            f"predict_both={self.predict_both}"
         )
 
     def init_weights(self):
@@ -190,7 +195,7 @@ class ViTMAE3D(nn.Module):
         target_coord: Float[Tensor, "B M 3"],
         partner_patches: Float[Tensor, "B K P"],
         partner_coord: Float[Tensor, "B K 3"],
-    ) -> Float[Tensor, "B M P"]:
+    ) -> Float[Tensor, "B M T*P"]:
         B = embeds.shape[0]
         M = target_coord.shape[1]
         assert target_coord.shape == (B, M, 3)
@@ -268,12 +273,23 @@ class ViTMAE3D(nn.Module):
         pred_patches = self.forward_decoder(
             embeds, vis_coord, target_coord, partner_vis_patches, partner_vis_coord
         )
+        if self.predict_both:
+            pred_own_patches, pred_patches = pred_patches.chunk(2, dim=2)
         # loss inside both brain masks
         loss_weight = target_mask_patches * partner_target_mask_patches
         error = F.mse_loss(pred_patches, target_patches, reduction="none")
         loss = (loss_weight * error).sum() / loss_weight.sum().clamp_min(1)
 
         state = {}
+        if self.predict_both:
+            # also predict A's own patches, as plain MAE
+            own_patches = patches[batch_ids, predict_ids].flatten(0, 1)
+            error_a = F.mse_loss(pred_own_patches, own_patches, reduction="none")
+            loss_a = (target_mask_patches * error_a).sum() / target_mask_patches.sum().clamp_min(1)
+            state["loss_a"] = loss_a.detach()
+            state["loss_b"] = loss.detach()
+            loss = (loss_a + loss) / 2
+
         if is_cross is not None:
             # loss split over cross-view (B != A) and self (B = A) sequences
             seq_is_cross = is_cross.repeat_interleave(num_samples)[:, None, None]

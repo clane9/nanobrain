@@ -48,6 +48,8 @@ model_kwargs:
   pos_embed: learned_sep
   # visible partner B patches given to the decoder
   num_partner_visible: 0
+  # decoder predicts A's own patches too, loss is the mean of the A and B losses
+  predict_both: false
 
 # Optimization. batch_size is images per step; each gives num_samples sequences.
 batch_size: 32
