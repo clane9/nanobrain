@@ -418,7 +418,7 @@ def make_batch_transform(args: DictConfig):
         if args.partners is None:
             partner_images = images
             partner_masks = masks
-            is_cross = torch.zeros(len(batch), dtype=torch.bool, device=images.device)
+            is_cross = None
         else:
             partners = []
             for sample, transformed in zip(batch, samples):
@@ -561,7 +561,7 @@ def plot_examples(
     )
     # partner visible panel only when the decoder sees partner patches
     partner_visible_mask = None
-    if model.num_partner_visible:
+    if state["partner_vis_ids"].shape[1] > 0:
         partner_visible_mask = patches_to_volume(
             torch.ones_like(state["partner_vis_patches"]),
             state["partner_vis_ids"],

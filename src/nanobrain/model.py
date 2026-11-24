@@ -201,15 +201,14 @@ class ViTMAE3D(nn.Module):
         if self.decoder_pos_embed is not None:
             mask_tokens = self.decoder_pos_embed(mask_tokens, target_coord)
 
-        if self.num_partner_visible:
+        # no partner tokens (K = 0) without a partner patch embed
+        partner_tokens = mask_tokens[:, :0]
+        if self.partner_patch_embed is not None:
             partner_tokens = self.partner_patch_embed(partner_patches)
             if self.decoder_pos_embed is not None:
                 partner_tokens = self.decoder_pos_embed(partner_tokens, partner_coord)
-            x = torch.cat([embeds, partner_tokens, mask_tokens], dim=1)
-            coord = torch.cat([coord, partner_coord, target_coord], dim=1)
-        else:
-            x = torch.cat([embeds, mask_tokens], dim=1)
-            coord = torch.cat([coord, target_coord], dim=1)
+        x = torch.cat([embeds, partner_tokens, mask_tokens], dim=1)
+        coord = torch.cat([coord, partner_coord, target_coord], dim=1)
         if self.class_tokens:
             coord = F.pad(coord, (0, 0, self.class_tokens, 0))
 
@@ -234,8 +233,7 @@ class ViTMAE3D(nn.Module):
         scores: Float[Tensor, "B S N"] | None = None,
         is_cross: Bool[Tensor, " B"] | None = None,
     ) -> tuple[Tensor, dict[str, Tensor]]:
-        # encode masked images A, predict partner images B at positions masked in A, given a few
-        # visible B patches. B = A for plain MAE. is_cross flags B != A, for logging
+        # encode masked A, predict partner B (B = A for plain MAE) at positions masked in A
         B = images.shape[0]
         assert tuple(images.shape[1:]) == tuple(self.grid_size)
 
@@ -273,7 +271,7 @@ class ViTMAE3D(nn.Module):
         # loss inside both brain masks
         loss_weight = target_mask_patches * partner_target_mask_patches
         error = F.mse_loss(pred_patches, target_patches, reduction="none")
-        loss = (loss_weight * error).sum() / loss_weight.sum()
+        loss = (loss_weight * error).sum() / loss_weight.sum().clamp_min(1)
 
         state = {}
         if is_cross is not None:
@@ -447,9 +445,11 @@ def sample_sequences(
     batch_size, num_patches, _ = mask_patches.shape
     device = mask_patches.device
     mask_frac = mask_patches.mean(dim=2)
+    both_frac = (mask_patches * partner_mask_patches).mean(dim=2)
+    partner_frac = partner_mask_patches.mean(dim=2)
     in_mask = mask_frac[:, None, :] >= min_mask_frac
-    in_both = (mask_patches * partner_mask_patches).mean(dim=2)[:, None, :] >= min_mask_frac
-    in_partner = partner_mask_patches.mean(dim=2)[:, None, :] >= min_mask_frac
+    in_both = both_frac[:, None, :] >= min_mask_frac
+    in_partner = partner_frac[:, None, :] >= min_mask_frac
     if num_predict is None:
         # one host sync to get the longest mask sequence in the batch
         num_predict = (mask_frac >= min_mask_frac).sum(dim=1).max().item() - num_visible

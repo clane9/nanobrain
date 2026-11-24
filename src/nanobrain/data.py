@@ -25,26 +25,24 @@ class Fomo300kDataset(Dataset):
         self.seed = seed
 
         # partner paths per image, empty for images without a partner
-        self.partners = [[] for _ in self.paths]
+        groups = {}
         if partners is not None:
-            table = pd.read_parquet(partners)
-            groups = table.groupby("path")["partner"].agg(list)
-            self.partners = [groups.get(path, []) for path in self.paths]
+            groups = pd.read_parquet(partners).groupby("path")["partner"].agg(list)
+        self.partners = [groups.get(path, []) for path in self.paths]
 
-        all_paths = set(self.paths)
-        for group in self.partners:
-            all_paths.update(group)
+        all_paths = set(self.paths).union(*self.partners)
         members = pd.read_parquet(
             self.root / "tables" / "shards.parquet", columns=["path", "shard", "offset", "size"]
         )
-        self.members = members[members["path"].isin(all_paths)].set_index("path")
-        assert len(self.members) == len(all_paths), "missing shard members"
+        members = members[members["path"].isin(all_paths)]
+        assert len(members) == len(all_paths), "missing shard members"
+        # path -> (shard, offset, size)
+        self.members = {row[0]: row[1:] for row in members.itertuples(index=False)}
 
     def __len__(self) -> int:
         return len(self.paths)
 
     def __getitem__(self, key: tuple[int, int]) -> dict:
-        # key is (image index, draw count) from InfiniteSampler. the draw seeds the partner choice
         index, draw = key
         sample = self.read(self.paths[index])
         partners = self.partners[index]
@@ -55,10 +53,10 @@ class Fomo300kDataset(Dataset):
 
     def read(self, path: str) -> dict:
         # npz members are stored uncompressed, so read them straight from their offset
-        member = self.members.loc[path]
-        with open(self.root / member["shard"], "rb") as shard:
-            shard.seek(member["offset"])
-            data = shard.read(member["size"])
+        shard_path, offset, size = self.members[path]
+        with open(self.root / shard_path, "rb") as shard:
+            shard.seek(offset)
+            data = shard.read(size)
         with np.load(io.BytesIO(data)) as npz:
             sample = {
                 "path": path,
@@ -73,10 +71,7 @@ class Fomo300kDataset(Dataset):
 
 
 class InfiniteSampler(Sampler[tuple[int, int]]):
-    """Endless shuffled passes over the dataset, starting from draw `start`.
-
-    Yields (sample index, draw count).
-    """
+    """Endless shuffled passes over the dataset from draw `start`, yielding (index, draw)."""
 
     def __init__(self, num_samples: int, seed: int = 0, start: int = 0):
         self.num_samples = num_samples
@@ -203,20 +198,15 @@ def resample_affine(
     shape: tuple[int, int, int],
 ) -> tuple[Tensor, Tensor]:
     # trilinear resample onto a new grid. voxel_map takes new grid voxels to input voxels
-    # grid_sample takes coords (x, y, z) = (k, j, i) scaled to [-1, 1] (align_corners)
-    to_grid_coords = []
-    for grid_shape in [image.shape, shape]:
-        matrix = np.zeros((4, 4))
-        for axis, size in enumerate(grid_shape):
-            matrix[2 - axis, axis] = 2 / (size - 1)
-            matrix[2 - axis, 3] = -1
-        matrix[3, 3] = 1
-        to_grid_coords.append(matrix)
-    input_to_grid, output_to_grid = to_grid_coords
-    theta = input_to_grid @ voxel_map @ np.linalg.inv(output_to_grid)
-    theta = torch.from_numpy(theta[:3]).float().to(image.device, non_blocking=True)
+    axes = [torch.arange(size, device=image.device, dtype=torch.float32) for size in shape]
+    coords = torch.stack(torch.meshgrid(*axes, indexing="ij"), dim=-1)
+    voxel_map = torch.as_tensor(voxel_map, device=image.device, dtype=torch.float32)
+    coords = coords @ voxel_map[:3, :3].T + voxel_map[:3, 3]
+    # grid_sample wants (x, y, z) = (last, middle, first) axis, normalized to [-1, 1]
+    sizes = torch.tensor(image.shape, device=image.device, dtype=torch.float32)
+    coords = 2 * coords / (sizes - 1).clamp_min(1) - 1
+    grid = coords.flip(-1)[None]
 
-    grid = F.affine_grid(theta[None], [1, 2, *shape], align_corners=True)
     channels = torch.stack([image, mask.float()])
     channels = F.grid_sample(channels[None], grid, mode="bilinear", align_corners=True)[0]
     mask = (channels[1] > 0.5).float()

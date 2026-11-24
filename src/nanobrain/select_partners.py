@@ -62,7 +62,7 @@ def main(args: argparse.Namespace):
         f"partners per image: median {num_partners.median():.0f}, max {num_partners.max()}"
     )
     # fractions of all draws. a draw picks each partner of an image with equal chance
-    weight = 1 / pairs.groupby("npz")["npz"].transform("size") / len(filelist)
+    weight = 1 / pairs["npz"].map(num_partners) / len(filelist)
     same_session = pairs["session"] == pairs["session_partner"]
     print(f"draws with a partner from the same session: {weight[same_session].sum():.1%}")
     other_sequence = pairs["sequence"] != pairs["sequence_partner"]

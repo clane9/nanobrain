@@ -27,8 +27,7 @@ def plot_mask_pred(
     vmin: float = -3.0,
     vmax: float = 3.0,
 ) -> Figure:
-    # all volumes shape [B, X, Y, Z]. pred is of partner_images (B = A for plain MAE).
-    # partner_visible_mask adds a panel of the visible partner patches
+    # all volumes shape [B, X, Y, Z]. pred is of partner_images (B = A for plain MAE)
     visible_mask = visible_mask > 0
     img_mask = img_mask > 0
     pred_mask = pred_mask > 0
